@@ -26,14 +26,14 @@
 <table align="center">
 <tr>
 <td width="50%">
-<a href="https://a360.co/48vL3j3" target="_blank">
-TRLC-DK1 Follower CAD (Fusion)<br>
+<a href="https://github.com/robot-learning-co/trlc-dk1/blob/main/hardware/TRLC-DK1-Follower_v0.2.0.step" target="_blank">
+TRLC-DK1 v0.2.0 Follower CAD (Fusion)<br>
 <img src="media/follower_cad.png" width="100%">
 </a>
 </td>
 <td width="50%">
-<a href="https://a360.co/4nmVNVC" target="_blank">
-TRLC-DK1 Leader CAD (Fusion)<br>
+<a href="https://a360.co/481PSQH" target="_blank">
+TRLC-DK1 v0.2.0 Leader CAD (Fusion)<br>
 <img src="media/leader_cad.png" width="100%">
 </a>
 </td>
