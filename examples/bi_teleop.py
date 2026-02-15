@@ -11,14 +11,14 @@ logger.setLevel(logging.DEBUG)
 init_logging()
 
 follower_config = BiDK1FollowerConfig(
-    left_arm_port="/dev/ttyACM1",
-    right_arm_port="/dev/ttyACM0",
-    joint_velocity_scaling=0.2,
+    left_arm_port="/dev/ttyACM4",
+    right_arm_port="/dev/ttyACM3",
+    joint_velocity_scaling=0.5,
 )
 
 leader_config = BiDK1LeaderConfig( 
-    left_arm_port="/dev/ttyACM3",
-    right_arm_port="/dev/ttyACM2",
+    left_arm_port="/dev/ttyACM2",
+    right_arm_port="/dev/ttyACM1",
 )
 
 leader = BiDK1Leader(leader_config)

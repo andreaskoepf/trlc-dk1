@@ -4,7 +4,7 @@ import time
 
 
 follower_config = DK1FollowerConfig(
-    port="/dev/ttyACM1",
+    port="/dev/ttyACM2",
     joint_velocity_scaling=0.2,
 )
 
