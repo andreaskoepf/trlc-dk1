@@ -14,23 +14,34 @@
 
 from dataclasses import dataclass, field
 from functools import cached_property
-import serial
-import time
 import logging
+import time
 from typing import Any
+
+import numpy as np
 
 from lerobot.cameras import CameraConfig
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.robots import Robot, RobotConfig
-from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
-
-from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import *
 
 logger = logging.getLogger(__name__)
 
+JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
-def map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
+# POS_VEL mode constants
+_DM4310_TORQUE_CONSTANT = 0.945    # Nm/A
+_EMIT_VELOCITY_SCALE = 100         # rad/s multiplier
+_EMIT_CURRENT_SCALE = 1000         # A multiplier
+_DM4310_SPEED = 200 / 60 * 2 * np.pi   # 200 rpm → rad/s
+_DM4340_SPEED = 52.5 / 60 * 2 * np.pi  # 52.5 rpm → rad/s
+_JOINT_LIMITS = {
+    "joint_4": (-100 / 180 * np.pi, 100 / 180 * np.pi),
+    "joint_5": (-90 / 180 * np.pi, 90 / 180 * np.pi),
+}
+
+
+def _map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
 
 
@@ -38,15 +49,28 @@ def map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: f
 @dataclass
 class DK1FollowerConfig(RobotConfig):
     port: str
+    # "impedance" — MIT mode + gravity compensation (via trlc_dk1_control / DK1Robot)
+    # "pos_vel"   — original POS_VEL mode with velocity scaling
+    control_mode: str = "impedance"
+    # Shared
+    max_gripper_torque: float = 1.0         # Nm
     disable_torque_on_disconnect: bool = False
-    joint_velocity_scaling: float = 0.2
-    max_gripper_torque: float = 1.0 # Nm (/0.00875m spur gear radius = 114N gripper force)
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    # POS_VEL mode only
+    joint_velocity_scaling: float = 0.2
 
 
 class DK1Follower(Robot):
     """
-    TRLC-DK1 Follower Arm designed by The Robot Learning Company.
+    TRLC-DK1 Follower Arm — LeRobot wrapper.
+
+    Two control modes selected via DK1FollowerConfig.control_mode:
+
+      "impedance"  MIT mode + gravity compensation, 250 Hz background thread.
+                   Wraps trlc_dk1_control.DK1Robot.  Non-blocking get/send.
+
+      "pos_vel"    Original POS_VEL mode with velocity scaling.
+                   Direct serial I/O on every get_observation() / send_action().
     """
 
     config_class = DK1FollowerConfig
@@ -54,22 +78,83 @@ class DK1Follower(Robot):
 
     def __init__(self, config: DK1FollowerConfig):
         super().__init__(config)
-        
-        # Constants for EMIT control
-        self.DM4310_TORQUE_CONSTANT = 0.945  # Nm/A
-        self.EMIT_VELOCITY_SCALE = 100  # rad/s
-        self.EMIT_CURRENT_SCALE = 1000  # A
-        
-        self.JOINT_LIMITS = {
-            "joint_4": (-100/180*np.pi, 100/180*np.pi),
-            "joint_5": (-90/180*np.pi, 90/180*np.pi),
-        }
-        
-        self.DM4310_SPEED = 200/60*2*np.pi   # rad/s (200  rpm | 20.94 rad/s)
-        self.DM4340_SPEED = 52.5/60*2*np.pi  # rad/s (52.5 rpm | 5.49  rad/s)
-
         self.config = config
-        self.motors = {
+        self.cameras = make_cameras_from_configs(config.cameras)
+
+        # Impedance mode state
+        self._robot = None              # DK1Robot | None
+
+        # POS_VEL mode state
+        self._serial_device = None
+        self._control = None
+        self._motors = None             # dict[str, Motor] | None
+        self._bus_connected = False
+        self._gripper_open_pos = 0.0
+        self._gripper_closed_pos = -4.7
+
+    # ------------------------------------------------------------------
+    # LeRobot feature descriptors  (same keys for both modes)
+    # ------------------------------------------------------------------
+
+    @cached_property
+    def observation_features(self) -> dict[str, type | tuple]:
+        motor_ft = {f"{j}.pos": float for j in JOINT_NAMES}
+        motor_ft["gripper.pos"] = float
+        cam_ft = {
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3)
+            for cam in self.cameras
+        }
+        return {**motor_ft, **cam_ft}
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        return {f"{j}.pos": float for j in JOINT_NAMES} | {"gripper.pos": float}
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def is_connected(self) -> bool:
+        cams_ok = all(cam.is_connected for cam in self.cameras.values())
+        if self.config.control_mode == "impedance":
+            return (
+                self._robot is not None
+                and self._robot._motor_chain.is_running
+                and cams_ok
+            )
+        else:
+            return self._bus_connected and cams_ok
+
+    def connect(self) -> None:
+        if self.is_connected:
+            raise DeviceAlreadyConnectedError(f"{self} already connected")
+
+        if self.config.control_mode == "impedance":
+            from trlc_dk1_control import DK1Robot, DK1_DEFAULT_CONFIG
+            cfg = DK1_DEFAULT_CONFIG(self.config.port)
+            cfg.max_gripper_torque_nm = self.config.max_gripper_torque
+            self._robot = DK1Robot(cfg)
+            self._robot.connect()
+        else:
+            self._connect_pos_vel()
+
+        for cam in self.cameras.values():
+            cam.connect()
+
+        logger.info(f"{self} connected (mode={self.config.control_mode}).")
+
+    def _connect_pos_vel(self) -> None:
+        import serial
+        from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import (
+            Motor, MotorControl, DM_Motor_Type,
+        )
+
+        self._serial_device = serial.Serial(self.config.port, 921600, timeout=0.5)
+        time.sleep(0.5)
+        self._control = MotorControl(self._serial_device)
+
+        self._motors = {
             "joint_1": Motor(DM_Motor_Type.DM4340, 0x01, 0x11),
             "joint_2": Motor(DM_Motor_Type.DM4340, 0x02, 0x12),
             "joint_3": Motor(DM_Motor_Type.DM4340, 0x03, 0x13),
@@ -78,51 +163,48 @@ class DK1Follower(Robot):
             "joint_6": Motor(DM_Motor_Type.DM4310, 0x06, 0x16),
             "gripper": Motor(DM_Motor_Type.DM4310, 0x07, 0x17),
         }
-        self.control = None
-        self.serial_device = None
-        self.bus_connected = False
+        self._bus_connected = True
+        self._configure_pos_vel()
 
-        self.gripper_open_pos = 0.0
-        self.gripper_closed_pos = -4.7
+    def _configure_pos_vel(self) -> None:
+        from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import (
+            Control_Type, DM_variable,
+        )
 
-        self.cameras = make_cameras_from_configs(config.cameras)
+        for key, motor in self._motors.items():
+            self._control.addMotor(motor)
+            for _ in range(3):
+                self._control.refresh_motor_status(motor)
+                time.sleep(0.01)
+            if self._control.read_motor_param(motor, DM_variable.CTRL_MODE) is not None:
+                print(f"{key} ({motor.MotorType.name}) is connected.")
+                self._control.switchControlMode(motor, Control_Type.POS_VEL)
+                self._control.enable(motor)
+            else:
+                raise RuntimeError(f"Unable to read from {key} ({motor.MotorType.name}).")
 
-    @property
-    def _motors_ft(self) -> dict[str, type]:
-        return {f"{motor}.pos": float for motor in self.motors}
+        for joint in ["joint_1", "joint_2", "joint_3"]:
+            self._control.change_motor_param(self._motors[joint], DM_variable.ACC, 10.0)
+            self._control.change_motor_param(self._motors[joint], DM_variable.DEC, -10.0)
+            self._control.change_motor_param(self._motors[joint], DM_variable.KP_APR, 200)
+            self._control.change_motor_param(self._motors[joint], DM_variable.KI_APR, 10)
 
-    @property
-    def _cameras_ft(self) -> dict[str, tuple]:
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        self._control.change_motor_param(self._motors["gripper"], DM_variable.KP_APR, 100)
 
-    @cached_property
-    def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
-
-    @cached_property
-    def action_features(self) -> dict[str, type]:
-        return self._motors_ft
-
-    @property
-    def is_connected(self) -> bool:
-        return self.bus_connected and all(cam.is_connected for cam in self.cameras.values())
-
-    def connect(self) -> None:
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
-
-        self.serial_device = serial.Serial(
-            self.config.port, 921600, timeout=0.5)
-        time.sleep(0.5)
-
-        self.control = MotorControl(self.serial_device)
-        self.bus_connected = True
-        self.configure()
-
-        for cam in self.cameras.values():
-            cam.connect()
+        # Calibrate gripper
+        self._control.switchControlMode(self._motors["gripper"], Control_Type.VEL)
+        self._control.control_Vel(self._motors["gripper"], 10.0)
+        while True:
+            self._control.refresh_motor_status(self._motors["gripper"])
+            if self._motors["gripper"].getTorque() > 1.2:
+                self._control.control_Vel(self._motors["gripper"], 0.0)
+                self._control.disable(self._motors["gripper"])
+                self._control.set_zero_position(self._motors["gripper"])
+                time.sleep(0.2)
+                self._control.enable(self._motors["gripper"])
+                break
+            time.sleep(0.01)
+        self._control.switchControlMode(self._motors["gripper"], Control_Type.Torque_Pos)
 
     @property
     def is_calibrated(self) -> bool:
@@ -132,113 +214,108 @@ class DK1Follower(Robot):
         pass
 
     def configure(self) -> None:
+        pass
 
-        for key, motor in self.motors.items():
-            self.control.addMotor(motor)
-
-            for _ in range(3):
-                self.control.refresh_motor_status(motor)
-                time.sleep(0.01)
-
-            if self.control.read_motor_param(motor, DM_variable.CTRL_MODE) is not None:
-                print(f"{key} ({motor.MotorType.name}) is connected.")
-
-                self.control.switchControlMode(motor, Control_Type.POS_VEL)
-                self.control.enable(motor)
-            else:
-                raise Exception(
-                    f"Unable to read from {key} ({motor.MotorType.name}).")
-
-        for joint in ["joint_1", "joint_2", "joint_3"]:
-            self.control.change_motor_param(self.motors[joint], DM_variable.ACC, 10.0)
-            self.control.change_motor_param(self.motors[joint], DM_variable.DEC, -10.0)
-            self.control.change_motor_param(self.motors[joint], DM_variable.KP_APR, 200)
-            self.control.change_motor_param(self.motors[joint], DM_variable.KI_APR, 10)
-
-        for joint in ["gripper"]:
-            self.control.change_motor_param(
-                self.motors[joint], DM_variable.KP_APR, 100)
-
-        # Open gripper and set zero position
-        self.control.switchControlMode(
-            self.motors["gripper"], Control_Type.VEL)
-        self.control.control_Vel(self.motors["gripper"], 10.0)
-        while True:
-            self.control.refresh_motor_status(self.motors["gripper"])
-            tau = self.motors["gripper"].getTorque()
-            if tau > 1.2:
-                self.control.control_Vel(self.motors["gripper"], 0.0)
-                self.control.disable(self.motors["gripper"])
-                self.control.set_zero_position(self.motors["gripper"])
-                time.sleep(0.2)
-                self.control.enable(self.motors["gripper"])
-                break
-            time.sleep(0.01)
-        self.control.switchControlMode(
-            self.motors["gripper"], Control_Type.Torque_Pos)
+    # ------------------------------------------------------------------
+    # Observation / action
+    # ------------------------------------------------------------------
 
     def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Read arm position
-        start = time.perf_counter()
+        if self.config.control_mode == "impedance":
+            obs = self._get_observation_impedance()
+        else:
+            obs = self._get_observation_pos_vel()
 
-        obs_dict = {}
-        for key, motor in self.motors.items():
-            self.control.refresh_motor_status(motor)
-            if key == "gripper":
-                # Normalize gripper position between 1 (closed) and 0 (open)
-                obs_dict[f"{key}.pos"] = map_range(
-                    motor.getPosition(), self.gripper_open_pos, self.gripper_closed_pos, 0.0, 1.0)
-            else:
-                obs_dict[f"{key}.pos"] = motor.getPosition()
-
-        dt_ms = (time.perf_counter() - start) * 1e3
-        logger.debug(f"{self} read state: {dt_ms:.1f}ms")
-
-        # Capture images from cameras
         for cam_key, cam in self.cameras.items():
-            start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
-            dt_ms = (time.perf_counter() - start) * 1e3
-            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+            obs[cam_key] = cam.async_read()
 
-        return obs_dict
+        return obs
+
+    def _get_observation_impedance(self) -> dict[str, Any]:
+        state = self._robot.get_joint_state()
+        gripper = self._robot.get_gripper_state()
+        obs = {f"{j}.pos": float(state["pos"][i]) for i, j in enumerate(JOINT_NAMES)}
+        obs["gripper.pos"] = gripper["pos"]
+        return obs
+
+    def _get_observation_pos_vel(self) -> dict[str, Any]:
+        obs: dict[str, Any] = {}
+        for key, motor in self._motors.items():
+            self._control.refresh_motor_status(motor)
+            if key == "gripper":
+                obs[f"{key}.pos"] = _map_range(
+                    motor.getPosition(),
+                    self._gripper_open_pos, self._gripper_closed_pos,
+                    0.0, 1.0,
+                )
+            else:
+                obs[f"{key}.pos"] = motor.getPosition()
+        return obs
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        goal_pos = {key.removesuffix(
-            ".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        if self.config.control_mode == "impedance":
+            q_des = np.array([action[f"{j}.pos"] for j in JOINT_NAMES])
+            self._robot.command_joint_pos(q_des)
+            self._robot.command_gripper(float(action["gripper.pos"]))
+            return action
+        else:
+            return self._send_action_pos_vel(action)
 
-        # Send goal position to the arm
-        for key, motor in self.motors.items():
+    def _send_action_pos_vel(self, action: dict[str, Any]) -> dict[str, Any]:
+        goal_pos = {
+            key.removesuffix(".pos"): val
+            for key, val in action.items()
+            if key.endswith(".pos")
+        }
+        vel_scale = self.config.joint_velocity_scaling
+
+        for key, motor in self._motors.items():
             if key == "gripper":
-                self.control.refresh_motor_status(motor)
-                gripper_goal_pos_mapped = map_range(goal_pos[key], 0.0, 1.0, self.gripper_open_pos, self.gripper_closed_pos)
-                self.control.control_pos_force(motor, gripper_goal_pos_mapped, self.DM4310_SPEED*self.EMIT_VELOCITY_SCALE,
-                                               i_des=self.config.max_gripper_torque/self.DM4310_TORQUE_CONSTANT*self.EMIT_CURRENT_SCALE)
+                self._control.refresh_motor_status(motor)
+                gripper_goal = _map_range(
+                    goal_pos[key], 0.0, 1.0,
+                    self._gripper_open_pos, self._gripper_closed_pos,
+                )
+                self._control.control_pos_force(
+                    motor, gripper_goal,
+                    _DM4310_SPEED * _EMIT_VELOCITY_SCALE,
+                    i_des=self.config.max_gripper_torque / _DM4310_TORQUE_CONSTANT * _EMIT_CURRENT_SCALE,
+                )
             else:
-                if key in self.JOINT_LIMITS:
-                    goal_pos[key] = np.clip(goal_pos[key], self.JOINT_LIMITS[key][0], self.JOINT_LIMITS[key][1])
+                if key in _JOINT_LIMITS:
+                    goal_pos[key] = float(np.clip(goal_pos[key], *_JOINT_LIMITS[key]))
+                speed = _DM4310_SPEED if key in ("joint_4", "joint_5", "joint_6") else _DM4340_SPEED
+                self._control.control_Pos_Vel(motor, goal_pos[key], vel_scale * speed)
 
-                self.control.control_Pos_Vel(
-                    motor, goal_pos[key], self.config.joint_velocity_scaling*self.DM4340_SPEED)
+        return {f"{k}.pos": v for k, v in goal_pos.items()}
 
-        return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+    # ------------------------------------------------------------------
+    # Disconnect
+    # ------------------------------------------------------------------
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.disable_torque_on_disconnect:
-            for motor in self.motors.values():
-                self.control.disable(motor)
+        if self.config.control_mode == "impedance":
+            self._robot.disconnect()
+            self._robot = None
         else:
-            self.control.serial_.close()
-        self.bus_connected = False
+            if self.config.disable_torque_on_disconnect:
+                for motor in self._motors.values():
+                    self._control.disable(motor)
+            else:
+                self._serial_device.close()
+            self._bus_connected = False
+            self._motors = None
+            self._control = None
+            self._serial_device = None
 
         for cam in self.cameras.values():
             cam.disconnect()
