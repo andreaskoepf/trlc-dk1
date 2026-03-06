@@ -51,6 +51,9 @@ struct RtLoopConfig {
     double emit_velocity_scale = 100.0;
     double emit_current_scale = 1000.0;
 
+    // Shutdown
+    bool disable_torque_on_disconnect = true;
+
     // RT
     int rt_priority = 80;
     int rt_cpu_affinity = -1;

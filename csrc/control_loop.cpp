@@ -92,9 +92,18 @@ void RtControlLoop::stop() {
 
     uint8_t frame[30];
     uint8_t rx_buf[256];
-    for (const auto& m : cfg_.motors) {
-        build_disable_frame(frame, m.slave_id);
-        send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
+
+    // Drain any pending data from the serial buffer
+    sleep_ms(50);
+    while (serial_.read_all(rx_buf, sizeof(rx_buf)) > 0) {}
+
+    // Disable all motors (arm + gripper) with 100ms delay between each
+    if (cfg_.disable_torque_on_disconnect) {
+        for (const auto& m : cfg_.motors) {
+            build_disable_frame(frame, m.slave_id);
+            send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
+            sleep_ms(100);
+        }
     }
 
     serial_.close();

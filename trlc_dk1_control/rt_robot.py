@@ -99,6 +99,7 @@ class DK1RobotRT:
         rt_cfg.torque_constant = config.DM4310_TORQUE_CONSTANT
         rt_cfg.emit_velocity_scale = config.EMIT_VELOCITY_SCALE
         rt_cfg.emit_current_scale = config.EMIT_CURRENT_SCALE
+        rt_cfg.disable_torque_on_disconnect = config.disable_torque_on_disconnect
 
         self._rt_cfg = rt_cfg
 

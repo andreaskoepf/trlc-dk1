@@ -66,6 +66,7 @@ NB_MODULE(_trlc_dk1_rt, m) {
         .def_rw("torque_constant", &RtLoopConfig::torque_constant)
         .def_rw("emit_velocity_scale", &RtLoopConfig::emit_velocity_scale)
         .def_rw("emit_current_scale", &RtLoopConfig::emit_current_scale)
+        .def_rw("disable_torque_on_disconnect", &RtLoopConfig::disable_torque_on_disconnect)
         .def_rw("rt_priority", &RtLoopConfig::rt_priority)
         .def_rw("rt_cpu_affinity", &RtLoopConfig::rt_cpu_affinity)
         .def_rw("rt_use_mlockall", &RtLoopConfig::rt_use_mlockall)
