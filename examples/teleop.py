@@ -50,11 +50,31 @@ def main():
     print()
     print("Teleop running — move the leader arm. Press Ctrl+C to stop.")
 
+    has_rt = hasattr(follower, '_robot') and follower._robot is not None
     try:
+        last_print_time = time.monotonic()
         while True:
             action = leader.get_action()
             follower.send_action(action)
             time.sleep(1.0 / args.hz)
+
+            now = time.monotonic()
+            if now - last_print_time >= 1.0 and has_rt:
+                last_print_time = now
+                state = follower._robot.get_joint_state()
+                grip = follower._robot.get_gripper_state()
+                perf = follower._robot.get_perf()
+
+                tau = state["torque"]
+                tau_str = " ".join(f"{t:+6.2f}" for t in tau)
+                grip_str = f"{grip['torque']:+5.2f}"
+
+                perf_str = ""
+                if perf is not None:
+                    perf_str = (f"  | RT: {perf.mean_cycle_us:.0f}/{perf.max_cycle_us:.0f}us"
+                                f" miss={perf.deadline_misses}")
+
+                print(f"  tau: {tau_str}  grip:{grip_str}{perf_str}")
     except KeyboardInterrupt:
         print("\nStopping teleop...")
 
