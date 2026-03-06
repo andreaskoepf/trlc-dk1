@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Gravity compensation measurement and URDF calibration tool.
+Gravity compensation measurement with friction cancellation.
 
-Measures the gravity model error by holding position with gravity comp
-enabled and observing the steady-state position drift. Since:
+Uses bi-directional approach: for each pose, commands a small offset
+above and below, then averages to cancel out motor friction.
 
-    At equilibrium: kp*(q_des - q_eq) + τ_model(q) = τ_real(q)
-    => gravity_model_error = kp * (q_actual - q_desired)
-
-Positive error means URDF overestimates gravity (model pushes up too much).
-Negative error means URDF underestimates gravity (arm droops).
+    From above: kp*(q_des - q_above) + τ_model - friction = τ_real
+    From below: kp*(q_des - q_below) + τ_model + friction = τ_real
+    Average:    τ_model_error = kp * (q_des - (q_above + q_below)/2)
+    Friction:   friction = kp * (q_below - q_above) / 2
 
 Usage:
     python examples/measure_gravity.py --port /dev/ttyACM1
@@ -68,51 +67,25 @@ def compute_mujoco_gravity(urdf_path, q):
         return None
 
 
-def print_measurement(idx, hold_pos, avg_pos, avg_torque, std_pos, mj_gravity):
-    pos_error = avg_pos - hold_pos
-    pos_error_deg = np.degrees(pos_error)
-    grav_model_error = DEFAULT_KP * pos_error
-
-    print(f"\n  Measurement #{idx}:")
-    print(f"  Hold pos (deg):   [{', '.join(f'{d:+7.1f}' for d in np.degrees(hold_pos))}]")
-    print(f"  Actual pos (deg): [{', '.join(f'{d:+7.1f}' for d in np.degrees(avg_pos))}]")
-    print(f"  Motor tau (Nm):   [{', '.join(f'{t:+7.3f}' for t in avg_torque)}]")
-    print()
-    header = f"  {'Joint':<10s} {'PosErr(deg)':>12s} {'GravErr(Nm)':>12s}"
-    if mj_gravity is not None:
-        header += f" {'MJ_grav(Nm)':>12s} {'Inferred(Nm)':>13s}"
-    print(header)
-
-    for i in range(6):
-        line = f"  {JOINT_NAMES[i]:<10s} {pos_error_deg[i]:>+12.3f} {grav_model_error[i]:>+12.3f}"
-        if mj_gravity is not None:
-            inferred_real = mj_gravity[i] - grav_model_error[i]
-            line += f" {mj_gravity[i]:>12.3f} {inferred_real:>+13.3f}"
-        print(line)
-
-    print()
-    print("  GravErr > 0: model overcompensates (pushes up)")
-    print("  GravErr < 0: model undercompensates (droops)")
-    print("  Inferred = what gravity really is at this pose")
-
-    return {
-        'hold_pos': hold_pos.copy(),
-        'actual_pos': avg_pos.copy(),
-        'pos_error_deg': pos_error_deg.copy(),
-        'motor_torque': avg_torque.copy(),
-        'grav_model_error': grav_model_error.copy(),
-        'mj_gravity': mj_gravity.copy() if mj_gravity is not None else None,
-    }
+def sample_position(loop, n_samples=50, dt=0.01):
+    """Collect position samples and return mean."""
+    positions = []
+    for _ in range(n_samples):
+        st = loop.get_joint_state()
+        positions.append(np.array(st.pos))
+        time.sleep(dt)
+    return np.mean(positions, axis=0)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Measure gravity torques for URDF calibration")
-    parser.add_argument("--port", default="/dev/ttyACM1", help="Serial port for follower arm")
+    parser = argparse.ArgumentParser(description="Bi-directional gravity measurement")
+    parser.add_argument("--port", default="/dev/ttyACM1", help="Serial port")
     parser.add_argument("--hz", type=float, default=250.0, help="Loop frequency")
-    parser.add_argument("--gravity-scale", type=float, default=1.0,
-                        help="Gravity comp scale")
-    parser.add_argument("--settle-time", type=float, default=3.0,
-                        help="Seconds to wait after setting hold position")
+    parser.add_argument("--gravity-scale", type=float, default=1.0, help="Gravity comp scale")
+    parser.add_argument("--settle-time", type=float, default=2.0,
+                        help="Seconds to wait after each offset command")
+    parser.add_argument("--offset-deg", type=float, default=5.0,
+                        help="Offset in degrees for bi-directional test")
     args = parser.parse_args()
 
     try:
@@ -137,105 +110,165 @@ def main():
     loop.command_joint_pos(hold_pos)
     loop.command_gripper(0.0)
 
+    offset_rad = np.radians(args.offset_deg)
     measurements = []
 
     print()
-    print("=" * 60)
-    print("  GRAVITY COMPENSATION MEASUREMENT")
-    print("=" * 60)
+    print("=" * 70)
+    print("  BI-DIRECTIONAL GRAVITY MEASUREMENT")
+    print("=" * 70)
     print()
-    print("  How it works:")
+    print("  This tool cancels motor friction by measuring from both directions.")
+    print()
+    print(f"  For each pose, it commands ±{args.offset_deg}° offsets on each joint,")
+    print("  measures where the arm actually settles, and averages to cancel")
+    print("  friction. This reveals the true gravity model error.")
+    print()
+    print("  How to use:")
     print("    1. Move the arm by hand to a pose")
-    print("    2. Press Enter — the script will:")
-    print("       a) Lock the current position as the target")
-    print(f"       b) Wait {args.settle_time}s for the arm to settle")
-    print("       c) Measure how far the arm drifted (= gravity error)")
+    print("    2. Press Enter — the script runs the bi-directional test")
+    print("       (takes ~30 seconds per pose — don't touch the arm)")
     print("    3. Repeat for different poses")
     print("    4. Type 'q' + Enter to quit and see results")
     print()
     print("  SUGGESTED POSES:")
-    print("    1. Rest position (don't move, just press Enter)")
-    print("    2. Arm extended horizontally (push joints 2+3 out)")
-    print("    3. Arm pointing up (vertical)")
-    print("    4. Wrist tilted down (bend joint 4 or 5)")
-    print("    5. Joint 2 at ~45 degrees")
+    print("    1. Rest position (as-is)")
+    print("    2. Arm extended horizontally (joints 2+3)")
+    print("    3. Wrist tilted down (joint 4 or 5)")
+    print("    4. Various arm angles")
     print()
-    print("=" * 60)
+    print("=" * 70)
     print()
 
     while True:
         try:
-            cmd = input(f"  [{len(measurements)} recorded] Move arm to a pose, then press Enter (q=quit) > ").strip().lower()
+            cmd = input(f"  [{len(measurements)} recorded] Move arm, press Enter (q=quit) > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             break
 
         if cmd == 'q':
             break
 
-        # Step 1: Read current position and set as hold target
+        # Read current position as the nominal pose
         state = loop.get_joint_state()
-        hold_pos = np.array(state.pos)
-        loop.command_joint_pos(hold_pos)
-        print(f"  Target locked at: [{', '.join(f'{d:+7.1f}' for d in np.degrees(hold_pos))}] deg")
+        nominal_pos = np.array(state.pos)
+        loop.command_joint_pos(nominal_pos)
+        print(f"  Nominal pose: [{', '.join(f'{d:+7.1f}' for d in np.degrees(nominal_pos))}] deg")
+        print(f"  Running bi-directional test (±{args.offset_deg}°)...")
 
-        # Step 2: Wait for arm to settle
-        print(f"  Settling for {args.settle_time}s...")
-        time.sleep(args.settle_time)
+        # For each joint, command offset above and below, measure settled position
+        settled_above = np.zeros(6)  # position when approached from above
+        settled_below = np.zeros(6)  # position when approached from below
 
-        # Step 3: Collect samples over 0.5s
-        n_samples = 50
-        torques_list = []
-        positions_list = []
-        for _ in range(n_samples):
-            st = loop.get_joint_state()
-            torques_list.append(np.array(st.torque))
-            positions_list.append(np.array(st.pos))
-            time.sleep(0.01)
+        for j in range(6):
+            # Test offset above: command nominal + offset, then back to nominal
+            pos_high = nominal_pos.copy()
+            pos_high[j] += offset_rad
+            loop.command_joint_pos(pos_high)
+            time.sleep(args.settle_time)
 
-        avg_torque = np.mean(torques_list, axis=0)
-        avg_pos = np.mean(positions_list, axis=0)
-        std_pos = np.std(positions_list, axis=0)
+            # Now command nominal — arm approaches from above
+            loop.command_joint_pos(nominal_pos)
+            time.sleep(args.settle_time)
+            settled_above[j] = sample_position(loop)[j]
 
-        # Step 4: Compute MuJoCo prediction at this pose
-        mj_gravity = compute_mujoco_gravity(urdf_path, hold_pos)
+            # Test offset below: command nominal - offset, then back to nominal
+            pos_low = nominal_pos.copy()
+            pos_low[j] -= offset_rad
+            loop.command_joint_pos(pos_low)
+            time.sleep(args.settle_time)
 
-        # Step 5: Print and store
-        m = print_measurement(len(measurements) + 1, hold_pos, avg_pos, avg_torque, std_pos, mj_gravity)
+            # Now command nominal — arm approaches from below
+            loop.command_joint_pos(nominal_pos)
+            time.sleep(args.settle_time)
+            settled_below[j] = sample_position(loop)[j]
+
+            # Return to nominal
+            loop.command_joint_pos(nominal_pos)
+
+            above_err = np.degrees(settled_above[j] - nominal_pos[j])
+            below_err = np.degrees(settled_below[j] - nominal_pos[j])
+            print(f"    {JOINT_NAMES[j]}: from_above={above_err:+.4f}° from_below={below_err:+.4f}°")
+
+        # Compute gravity model error (friction-cancelled)
+        midpoint = (settled_above + settled_below) / 2.0
+        grav_model_error = DEFAULT_KP * (midpoint - nominal_pos)
+
+        # Compute friction estimate
+        friction = DEFAULT_KP * (settled_below - settled_above) / 2.0
+
+        # MuJoCo prediction
+        mj_gravity = compute_mujoco_gravity(urdf_path, nominal_pos)
+
+        m = {
+            'nominal_pos': nominal_pos.copy(),
+            'settled_above': settled_above.copy(),
+            'settled_below': settled_below.copy(),
+            'grav_model_error': grav_model_error.copy(),
+            'friction': friction.copy(),
+            'mj_gravity': mj_gravity.copy() if mj_gravity is not None else None,
+        }
         measurements.append(m)
+
+        # Print results
+        print()
+        header = f"  {'Joint':<10s} {'GravErr(Nm)':>12s} {'Friction(Nm)':>13s}"
+        if mj_gravity is not None:
+            header += f" {'MJ_model(Nm)':>13s} {'Real_grav(Nm)':>14s}"
+        print(header)
+
+        for i in range(6):
+            line = f"  {JOINT_NAMES[i]:<10s} {grav_model_error[i]:>+12.3f} {friction[i]:>13.3f}"
+            if mj_gravity is not None:
+                real_grav = mj_gravity[i] - grav_model_error[i]
+                line += f" {mj_gravity[i]:>13.3f} {real_grav:>+14.3f}"
+            print(line)
+
+        print()
+        print("  GravErr: model - real gravity (+ = overcompensates, - = undercompensates)")
+        print("  Friction: estimated static friction per joint")
         print()
 
-    # Final summary
+    # Summary
     if measurements:
         print("\n" + "=" * 80)
-        print("SUMMARY: All Measurements")
+        print("SUMMARY")
         print("=" * 80)
 
         has_mj = measurements[0]['mj_gravity'] is not None
 
         for idx, m in enumerate(measurements):
-            print(f"\n--- Pose #{idx+1} (hold: [{', '.join(f'{d:+6.1f}' for d in np.degrees(m['hold_pos']))}] deg) ---")
-            print(f"  Pos err (deg): [{', '.join(f'{e:+7.3f}' for e in m['pos_error_deg'])}]")
-            print(f"  Grav err (Nm): [{', '.join(f'{e:+7.3f}' for e in m['grav_model_error'])}]")
+            print(f"\n--- Pose #{idx+1} ([{', '.join(f'{d:+6.1f}' for d in np.degrees(m['nominal_pos']))}] deg) ---")
+            print(f"  Grav err (Nm):  [{', '.join(f'{e:+7.3f}' for e in m['grav_model_error'])}]")
+            print(f"  Friction (Nm):  [{', '.join(f'{f:7.3f}' for f in m['friction'])}]")
             if has_mj and m['mj_gravity'] is not None:
-                inferred = m['mj_gravity'] - m['grav_model_error']
-                print(f"  MJ model (Nm): [{', '.join(f'{t:+7.3f}' for t in m['mj_gravity'])}]")
-                print(f"  Inferred (Nm): [{', '.join(f'{t:+7.3f}' for t in inferred)}]")
+                real_grav = m['mj_gravity'] - m['grav_model_error']
+                print(f"  MJ model (Nm):  [{', '.join(f'{t:+7.3f}' for t in m['mj_gravity'])}]")
+                print(f"  Real grav (Nm): [{', '.join(f'{t:+7.3f}' for t in real_grav)}]")
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    scale = np.where(np.abs(m['mj_gravity']) > 0.5,
+                                     real_grav / m['mj_gravity'],
+                                     np.nan)
+                print(f"  Scale factor:   [{', '.join(f'{s:+7.3f}' if not np.isnan(s) else '    N/A' for s in scale)}]")
 
-        if len(measurements) > 1 and has_mj:
-            print("\n--- Per-Joint Analysis ---")
-            print(f"  {'Joint':<10s} {'MeanErr(Nm)':>12s} {'Interpretation':>40s}")
+        if len(measurements) > 1:
+            print("\n--- Per-Joint Average ---")
             all_errors = np.array([m['grav_model_error'] for m in measurements])
+            all_friction = np.array([m['friction'] for m in measurements])
             mean_err = np.mean(all_errors, axis=0)
+            mean_friction = np.mean(all_friction, axis=0)
+
+            print(f"  {'Joint':<10s} {'MeanGravErr':>12s} {'MeanFriction':>13s} {'Interpretation':>30s}")
             for i in range(6):
                 if abs(mean_err[i]) > 1.0:
-                    direction = "OVER (pushes up)" if mean_err[i] > 0 else "UNDER (droops)"
+                    direction = "OVER" if mean_err[i] > 0 else "UNDER"
                     interp = f"{direction} by {abs(mean_err[i]):.1f} Nm"
                 elif abs(mean_err[i]) > 0.3:
                     direction = "slightly over" if mean_err[i] > 0 else "slightly under"
                     interp = f"{direction} by {abs(mean_err[i]):.1f} Nm"
                 else:
                     interp = "OK (< 0.3 Nm)"
-                print(f"  {JOINT_NAMES[i]:<10s} {mean_err[i]:>+12.3f} {interp:>40s}")
+                print(f"  {JOINT_NAMES[i]:<10s} {mean_err[i]:>+12.3f} {mean_friction[i]:>13.3f} {interp:>30s}")
 
     print("\nStopping...")
     loop.stop()

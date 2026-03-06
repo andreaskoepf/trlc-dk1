@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--gravity-scale", type=float, default=0.5,
                         help="Gravity compensation scale")
     parser.add_argument("--hz", type=float, default=200.0, help="Teleop loop frequency")
+    parser.add_argument("--disable-torque-on-disconnect", action="store_true",
+                        help="Disable motor torque on shutdown")
     args = parser.parse_args()
 
     leader_config = DK1LeaderConfig(port=args.leader)
@@ -30,6 +32,7 @@ def main():
         port=args.follower,
         control_mode=args.mode,
         gravity_comp_scale=args.gravity_scale,
+        disable_torque_on_disconnect=args.disable_torque_on_disconnect,
     )
 
     print(f"Leader:   {args.leader}")

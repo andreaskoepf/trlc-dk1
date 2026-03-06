@@ -148,6 +148,7 @@ class DK1Follower(Robot):
             cfg = DK1_DEFAULT_CONFIG(self.config.port)
             cfg.max_gripper_torque_nm = self.config.max_gripper_torque
             cfg.gravity_comp_scale = self.config.gravity_comp_scale
+            cfg.disable_torque_on_disconnect = self.config.disable_torque_on_disconnect
             self._robot = DK1RobotRT(cfg)
             self._robot.connect()
         else:
