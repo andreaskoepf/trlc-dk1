@@ -49,13 +49,16 @@ def _map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: 
 @dataclass
 class DK1FollowerConfig(RobotConfig):
     port: str
-    # "impedance" — MIT mode + gravity compensation (via trlc_dk1_control / DK1Robot)
-    # "pos_vel"   — original POS_VEL mode with velocity scaling
-    control_mode: str = "impedance"
+    # "impedance"    — MIT mode + gravity compensation (Python DK1Robot)
+    # "rt_impedance" — MIT mode + gravity compensation (C++ RT control loop)
+    # "pos_vel"      — original POS_VEL mode with velocity scaling
+    control_mode: str = "rt_impedance"
     # Shared
     max_gripper_torque: float = 1.0         # Nm
     disable_torque_on_disconnect: bool = False
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
+    # Impedance mode
+    gravity_comp_scale: float = 1.0         # full gravity compensation
     # POS_VEL mode only
     joint_velocity_scaling: float = 0.2
 
@@ -123,6 +126,8 @@ class DK1Follower(Robot):
                 and self._robot._motor_chain.is_running
                 and cams_ok
             )
+        elif self.config.control_mode == "rt_impedance":
+            return self._robot is not None and cams_ok
         else:
             return self._bus_connected and cams_ok
 
@@ -134,7 +139,16 @@ class DK1Follower(Robot):
             from trlc_dk1_control import DK1Robot, DK1_DEFAULT_CONFIG
             cfg = DK1_DEFAULT_CONFIG(self.config.port)
             cfg.max_gripper_torque_nm = self.config.max_gripper_torque
+            cfg.gravity_comp_scale = self.config.gravity_comp_scale
             self._robot = DK1Robot(cfg)
+            self._robot.connect()
+        elif self.config.control_mode == "rt_impedance":
+            from trlc_dk1_control import DK1_DEFAULT_CONFIG
+            from trlc_dk1_control.rt_robot import DK1RobotRT
+            cfg = DK1_DEFAULT_CONFIG(self.config.port)
+            cfg.max_gripper_torque_nm = self.config.max_gripper_torque
+            cfg.gravity_comp_scale = self.config.gravity_comp_scale
+            self._robot = DK1RobotRT(cfg)
             self._robot.connect()
         else:
             self._connect_pos_vel()
@@ -224,7 +238,7 @@ class DK1Follower(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.control_mode == "impedance":
+        if self.config.control_mode in ("impedance", "rt_impedance"):
             obs = self._get_observation_impedance()
         else:
             obs = self._get_observation_pos_vel()
@@ -259,7 +273,7 @@ class DK1Follower(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.control_mode == "impedance":
+        if self.config.control_mode in ("impedance", "rt_impedance"):
             q_des = np.array([action[f"{j}.pos"] for j in JOINT_NAMES])
             self._robot.command_joint_pos(q_des)
             self._robot.command_gripper(float(action["gripper.pos"]))
@@ -303,7 +317,7 @@ class DK1Follower(Robot):
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        if self.config.control_mode == "impedance":
+        if self.config.control_mode in ("impedance", "rt_impedance"):
             self._robot.disconnect()
             self._robot = None
         else:

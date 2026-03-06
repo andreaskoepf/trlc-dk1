@@ -1,32 +1,10 @@
 from __future__ import annotations
 
 import logging
-import xml.etree.ElementTree as ET
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-
-def _urdf_strip_meshes(urdf_path: str) -> str:
-    """
-    Return a URDF XML string with all mesh geometry replaced by a tiny sphere.
-
-    MuJoCo's URDF parser strips the directory prefix from mesh filenames, which
-    breaks loading when meshes live in subdirectories.  For inverse dynamics we
-    only need mass/inertia/joint data — geometry is irrelevant — so we swap every
-    <mesh> element for a <sphere radius="0.001"/> to satisfy MuJoCo's parser.
-    """
-    tree = ET.parse(urdf_path)
-    root = tree.getroot()
-
-    for geometry in root.iter("geometry"):
-        mesh = geometry.find("mesh")
-        if mesh is not None:
-            geometry.remove(mesh)
-            ET.SubElement(geometry, "sphere", {"radius": "0.001"})
-
-    return ET.tostring(root, encoding="unicode")
 
 
 class GravityCompensator:
@@ -36,6 +14,9 @@ class GravityCompensator:
     Only the first `num_dofs` joints of the model are used (arm joints).
     The gripper is excluded — its gravity contribution is negligible and
     it operates in force-position (EMIT) mode.
+
+    The URDF must contain ``<mujoco><compiler strippath="false"/></mujoco>``
+    so that MuJoCo can resolve relative mesh paths.
 
     Args:
         model_path: Path to a MuJoCo XML (.xml) or URDF (.urdf) file.
@@ -54,12 +35,7 @@ class GravityCompensator:
         self._mujoco = mujoco
         self.num_dofs = num_dofs
 
-        if model_path.endswith(".urdf"):
-            xml_str = _urdf_strip_meshes(model_path)
-            self.mj_model = mujoco.MjModel.from_xml_string(xml_str)
-        else:
-            self.mj_model = mujoco.MjModel.from_xml_path(model_path)
-
+        self.mj_model = mujoco.MjModel.from_xml_path(model_path)
         self.mj_data = mujoco.MjData(self.mj_model)
 
         if self.mj_model.nq < num_dofs:
@@ -88,8 +64,12 @@ class GravityCompensator:
         self.mj_data.qpos[: self.num_dofs] = q[: self.num_dofs]
         self.mj_data.qvel[:] = 0.0
         self.mj_data.qacc[:] = 0.0
-        mujoco.mj_inverse(self.mj_model, self.mj_data)
-        return self.mj_data.qfrc_inverse[: self.num_dofs].copy()
+        # Use mj_forward + qfrc_bias instead of mj_inverse + qfrc_inverse.
+        # mj_inverse includes constraint forces from joint limits which can
+        # produce wildly incorrect torques near limit boundaries.
+        # qfrc_bias with qvel=0 gives pure gravity torques.
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+        return self.mj_data.qfrc_bias[: self.num_dofs].copy()
 
 
 class NoGravityComp:

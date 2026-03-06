@@ -1,6 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <robot
   name="TRLC-DK1-Follower">
+  <!-- MuJoCo compiler settings: strippath defaults to "true" for URDF, which
+       strips directory prefixes from mesh filenames and breaks loading when
+       meshes live in subdirectories. Setting it to "false" preserves relative
+       paths like "meshes/visual/base_link.glb".
+       See: https://mujoco.readthedocs.io/en/stable/XMLreference.html#compiler -->
+  <mujoco>
+    <compiler strippath="false" balanceinertia="true"/>
+  </mujoco>
   <!--
   Joint limits:
     - joint1: -2.094 to 2.094 (±120°)
