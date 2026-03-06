@@ -103,6 +103,11 @@ class DK1Follower(Robot):
     def observation_features(self) -> dict[str, type | tuple]:
         motor_ft = {f"{j}.pos": float for j in JOINT_NAMES}
         motor_ft["gripper.pos"] = float
+        if self.config.control_mode in ("impedance", "rt_impedance"):
+            for j in JOINT_NAMES:
+                motor_ft[f"{j}.vel"] = float
+                motor_ft[f"{j}.torque"] = float
+            motor_ft["gripper.torque"] = float
         cam_ft = {
             cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3)
             for cam in self.cameras
@@ -252,8 +257,13 @@ class DK1Follower(Robot):
     def _get_observation_impedance(self) -> dict[str, Any]:
         state = self._robot.get_joint_state()
         gripper = self._robot.get_gripper_state()
-        obs = {f"{j}.pos": float(state["pos"][i]) for i, j in enumerate(JOINT_NAMES)}
+        obs = {}
+        for i, j in enumerate(JOINT_NAMES):
+            obs[f"{j}.pos"] = float(state["pos"][i])
+            obs[f"{j}.vel"] = float(state["vel"][i])
+            obs[f"{j}.torque"] = float(state["torque"][i])
         obs["gripper.pos"] = gripper["pos"]
+        obs["gripper.torque"] = gripper["torque"]
         return obs
 
     def _get_observation_pos_vel(self) -> dict[str, Any]:
