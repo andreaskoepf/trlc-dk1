@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <sstream>
 #include <stdexcept>
 #include <time.h>
 
@@ -58,6 +59,24 @@ RtControlLoop::~RtControlLoop() {
 void RtControlLoop::start() {
     if (running_.load()) {
         throw std::runtime_error("RtControlLoop already running");
+    }
+
+    // Validate configuration
+    if (cfg_.loop_hz <= 0.0 || cfg_.loop_hz > 10000.0) {
+        throw std::invalid_argument("loop_hz must be in (0, 10000], got: " +
+                                    std::to_string(cfg_.loop_hz));
+    }
+    if (cfg_.motors.size() < 7) {
+        throw std::invalid_argument("Need at least 7 motor descriptors (6 arm + 1 gripper), got: " +
+                                    std::to_string(cfg_.motors.size()));
+    }
+    if (cfg_.command_timeout_s <= 0.0) {
+        throw std::invalid_argument("command_timeout_s must be positive, got: " +
+                                    std::to_string(cfg_.command_timeout_s));
+    }
+    if (cfg_.min_motors_required < 0 || cfg_.min_motors_required > 6) {
+        throw std::invalid_argument("min_motors_required must be in [0, 6], got: " +
+                                    std::to_string(cfg_.min_motors_required));
     }
 
     if (!serial_.open(cfg_.serial_port, 921600)) {
@@ -175,13 +194,39 @@ GripperState RtControlLoop::get_gripper_state() const {
     return result;
 }
 
+HealthState RtControlLoop::get_health() const {
+    HealthState result;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        uint64_t s1 = health_seq_.load(std::memory_order_acquire);
+        if (s1 & 1) continue;
+        result = health_buf_;
+        uint64_t s2 = health_seq_.load(std::memory_order_acquire);
+        if (s1 == s2) return result;
+    }
+    return result;  // best effort
+}
+
+void RtControlLoop::reset_errors(int timeout_ms) {
+    if (!running_.load(std::memory_order_acquire)) return;
+    uint64_t before = error_reset_ack_.load(std::memory_order_acquire);
+    error_reset_requested_.store(true, std::memory_order_release);
+    if (timeout_ms <= 0) return;  // fire-and-forget
+    for (int waited = 0; waited < timeout_ms; ++waited) {
+        if (error_reset_ack_.load(std::memory_order_acquire) != before) return;
+        if (!running_.load(std::memory_order_acquire)) return;
+        struct timespec ts = {0, 1000000};  // 1ms
+        nanosleep(&ts, nullptr);
+    }
+    throw std::runtime_error("reset_errors() timed out waiting for RT thread acknowledgment");
+}
+
 PerfSnapshot RtControlLoop::get_perf() const { return perf_.snapshot(); }
 
 size_t RtControlLoop::read_cycle_times(float* buf, size_t max) const {
     return perf_.read_ring(buf, max);
 }
 
-void RtControlLoop::reset_perf() { perf_.reset(); }
+void RtControlLoop::reset_perf(int timeout_ms) { perf_.reset(timeout_ms); }
 
 // --- Motor configuration ---
 
@@ -271,8 +316,31 @@ void RtControlLoop::configure_motors() {
         }
     }
 
-    if (total_got < 6) {
-        std::fprintf(stderr, "WARNING: only got initial state for %d/6 arm motors!\n", total_got);
+    if (total_got < cfg_.min_motors_required) {
+        // Disable motors we already enabled before throwing
+        for (size_t i = 0; i < 6; ++i) {
+            build_disable_frame(frame, cfg_.motors[i].slave_id);
+            send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 50000);
+        }
+
+        char hex_buf[16];
+        std::ostringstream msg;
+        msg << "Motor initialization failed: only " << total_got
+            << "/6 arm motors responded (minimum required: "
+            << cfg_.min_motors_required
+            << "). Check that motors are powered on and CAN bus is connected.";
+        for (size_t i = 0; i < 6; ++i) {
+            if (!got_initial[i]) {
+                std::snprintf(hex_buf, sizeof(hex_buf), "0x%02X", cfg_.motors[i].master_id);
+                msg << "\n  MISSING: " << cfg_.motors[i].name
+                    << " (slave=" << cfg_.motors[i].slave_id
+                    << " master=" << hex_buf << ")";
+            }
+        }
+        throw std::runtime_error(msg.str());
+    } else if (total_got < 6) {
+        std::fprintf(stderr, "WARNING: only got initial state for %d/6 arm motors (min_required=%d)!\n",
+                     total_got, cfg_.min_motors_required);
         for (size_t i = 0; i < 6; ++i) {
             if (!got_initial[i]) {
                 std::fprintf(stderr, "  MISSING: %s (slave=%d master=0x%02X) — pos will be 0!\n",
@@ -307,12 +375,15 @@ void RtControlLoop::calibrate_gripper() {
     constexpr int MAX_CAL_ITERATIONS = 2000;  // ~10s at 5ms per iteration
     constexpr float TORQUE_THRESHOLD = 1.2f;  // matches Python DM_CAN calibration
 
+    const uint64_t cal_deadline_ns = now_ns() +
+        static_cast<uint64_t>(cfg_.gripper_cal_timeout_s * 1e9);
+
     // Send VEL command ONCE to start the gripper moving
     build_vel_frame(frame, gm.slave_id, 10.0f);
     send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 5000);
 
     // Poll with refresh frames to read torque (like Python version)
-    while (cal_iterations < MAX_CAL_ITERATIONS) {
+    while (cal_iterations < MAX_CAL_ITERATIONS && now_ns() < cal_deadline_ns) {
         build_refresh_frame(frame, gm.slave_id);
         size_t n = send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 10000);
 
@@ -348,16 +419,24 @@ void RtControlLoop::calibrate_gripper() {
         sleep_ms(10);  // match Python's time.sleep(0.01)
     }
 
-    // Timeout — stop gripper and proceed without calibration
-    std::fprintf(stderr, "WARNING: Gripper calibration timed out after %d iterations! "
-                 "Torque never exceeded %.1f. Proceeding with gripper_open_pos=0.\n",
-                 MAX_CAL_ITERATIONS, TORQUE_THRESHOLD);
+    // Timeout — stop gripper and throw
     build_vel_frame(frame, gm.slave_id, 0.0f);
     send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 50000);
     build_disable_frame(frame, gm.slave_id);
     send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
-    build_enable_frame(frame, gm.slave_id);
-    send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
+    {
+        std::string msg = "Gripper calibration timed out after " +
+            std::to_string(cfg_.gripper_cal_timeout_s) + "s (" +
+            std::to_string(cal_iterations) + " valid packets received). ";
+        if (cal_iterations == 0) {
+            msg += "No motor state packets were received — check that the gripper motor "
+                   "(slave=" + std::to_string(gm.slave_id) + ") is powered on.";
+        } else {
+            msg += "Torque never exceeded threshold " + std::to_string(TORQUE_THRESHOLD) +
+                   ". The gripper may be unobstructed or the threshold may need adjustment.";
+        }
+        throw std::runtime_error(msg);
+    }
 
 calibration_done:
     parser_.clear();
@@ -435,6 +514,9 @@ void RtControlLoop::rt_thread_func() {
 
     uint64_t loop_count = 0;
 
+    // Comm loss state machine
+    bool comm_error_disable_sent = false;
+
     // Warmup phase: send refresh frames for a few cycles to fill the pipeline
     // before sending MIT commands. This ensures cur_pos is populated from
     // actual motor feedback, not zeros.
@@ -454,6 +536,14 @@ void RtControlLoop::rt_thread_func() {
             parser_.feed(rx_buf, n);
         }
 
+        // Communication loss tracking
+        health_rt_.total_rx_bytes += total_rx;
+        if (total_rx == 0) {
+            ++health_rt_.consecutive_empty_cycles;
+        } else {
+            health_rt_.consecutive_empty_cycles = 0;
+        }
+
         // 2. Parse received packets and update motor state
         packets.clear();
         parser_.extract(packets);
@@ -462,6 +552,8 @@ void RtControlLoop::rt_thread_func() {
             std::fprintf(stderr, "[cycle %llu] rx_bytes=%zu packets=%zu\n",
                          (unsigned long long)loop_count, total_rx, packets.size());
         }
+
+        uint8_t motor_responded = 0;  // bitmask, bit i = motor i responded this cycle
 
         for (const auto& pkt : packets) {
             uint32_t can_id = decode_can_id(pkt.data());
@@ -483,6 +575,7 @@ void RtControlLoop::rt_thread_func() {
                     cur_pos[i] = st.q;
                     cur_vel[i] = st.dq;
                     cur_torque[i] = st.tau;
+                    if (i < 7) motor_responded |= (1u << i);
                     matched = true;
                     if (debug) {
                         std::fprintf(stderr, "  motor[%zu] %s: pos=%.4f vel=%.4f tau=%.4f (can_id=0x%03X)\n",
@@ -496,6 +589,34 @@ void RtControlLoop::rt_thread_func() {
             }
         }
 
+        // Per-motor staleness tracking
+        for (size_t i = 0; i < cfg_.motors.size() && i < 7; ++i) {
+            if (motor_responded & (1u << i)) {
+                health_rt_.motor_last_seen_cycle[i] = loop_count;
+                health_rt_.motor_stale[i] = false;
+            } else {
+                if (loop_count - health_rt_.motor_last_seen_cycle[i] >=
+                    static_cast<uint64_t>(cfg_.per_motor_stale_threshold)) {
+                    health_rt_.motor_stale[i] = true;
+                }
+            }
+        }
+
+        // Comm error state machine (only active after warmup)
+        if (loop_count > WARMUP_CYCLES) {
+            if (!health_rt_.comm_loss) {
+                if (health_rt_.consecutive_empty_cycles >= cfg_.max_consecutive_empty_cycles) {
+                    health_rt_.comm_loss = true;
+                    comm_error_disable_sent = false;
+                    std::fprintf(stderr, "[cycle %llu] COMM ERROR: %d consecutive empty cycles, "
+                                 "entering comm loss state (action=%s)\n",
+                                 (unsigned long long)loop_count,
+                                 health_rt_.consecutive_empty_cycles,
+                                 cfg_.comm_loss_action == CommLossAction::DISABLE ? "DISABLE" : "HOLD");
+                }
+            }
+        }
+
         // 3. Write state (seqlock) — so Python sees the latest even during computation
         {
             uint64_t s = state_seq_.load(std::memory_order_relaxed);
@@ -506,13 +627,25 @@ void RtControlLoop::rt_thread_func() {
             state_seq_.store(s + 2, std::memory_order_release);
         }
 
+        // Publish health state (seqlock)
+        health_rt_.loop_count = loop_count;
+        {
+            uint64_t s = health_seq_.load(std::memory_order_relaxed);
+            health_seq_.store(s + 1, std::memory_order_release);
+            health_buf_ = health_rt_;
+            health_seq_.store(s + 2, std::memory_order_release);
+        }
+
         // During warmup, send refresh frames only (no MIT commands).
         // This populates cur_pos from actual motor feedback before we start controlling.
         if (loop_count <= WARMUP_CYCLES) {
             for (size_t i = 0; i < cfg_.motors.size(); ++i) {
                 const auto& m = cfg_.motors[i];
                 build_refresh_frame(tx_frame, m.slave_id);
-                serial_.write(tx_frame, 30);
+                if (!serial_.write(tx_frame, 30)) {
+                    ++health_rt_.total_write_errors;
+                }
+                ++health_rt_.total_tx_frames;
             }
             if (debug) {
                 std::fprintf(stderr, "  [warmup %llu/%d] sent refresh frames, cur_pos=[",
@@ -521,7 +654,7 @@ void RtControlLoop::rt_thread_func() {
                 std::fprintf(stderr, "]\n");
             }
 
-            // At end of warmup, update command buffer to match actual positions
+            // At end of warmup, update command buffer and slew target to match actual positions
             if (loop_count == WARMUP_CYCLES) {
                 uint64_t s = cmd_seq_.load(std::memory_order_relaxed);
                 cmd_seq_.store(s + 1, std::memory_order_release);
@@ -530,7 +663,16 @@ void RtControlLoop::rt_thread_func() {
                 }
                 cmd_buf_.timestamp_ns = now_ns();
                 cmd_seq_.store(s + 2, std::memory_order_release);
-                std::fprintf(stderr, "  [warmup done] command buffer updated to actual pos\n");
+
+                // Initialize slew target to actual motor positions
+                for (int i = 0; i < 6; ++i) {
+                    slew_target_[static_cast<size_t>(i)] = cur_pos[static_cast<size_t>(i)];
+                }
+
+                // Reset comm counters so warmup's empty cycles don't trigger comm loss
+                health_rt_.consecutive_empty_cycles = 0;
+
+                std::fprintf(stderr, "  [warmup done] command buffer and slew target initialized to actual pos\n");
             }
 
             uint64_t t1 = now_ns();
@@ -542,7 +684,24 @@ void RtControlLoop::rt_thread_func() {
             continue;
         }
 
-        // 4. Read commands (seqlock)
+        // 4. Handle error reset request (from Python thread)
+        if (error_reset_requested_.exchange(false, std::memory_order_acq_rel)) {
+            safety_state_.damping_mode = false;
+            safety_state_.overcurrent_count = 0;
+            safety_state_.overspeed_count = 0;
+            health_rt_.comm_loss = false;
+            health_rt_.consecutive_empty_cycles = 0;
+            comm_error_disable_sent = false;
+            // Snap slew target to current position to prevent jump after reset
+            for (int i = 0; i < 6; ++i) {
+                slew_target_[static_cast<size_t>(i)] = cur_pos[static_cast<size_t>(i)];
+            }
+            error_reset_ack_.fetch_add(1, std::memory_order_release);
+            std::fprintf(stderr, "[cycle %llu] Error reset acknowledged\n",
+                         (unsigned long long)loop_count);
+        }
+
+        // 5. Read commands (seqlock)
         CommandBuffer cmd;
         for (int attempt = 0; attempt < 100; ++attempt) {
             uint64_t s1 = cmd_seq_.load(std::memory_order_acquire);
@@ -552,7 +711,7 @@ void RtControlLoop::rt_thread_func() {
             if (s1 == s2) break;
         }
 
-        // 5. Watchdog
+        // 6. Watchdog
         uint64_t cmd_age_ns = t0 - cmd.timestamp_ns;
         double cmd_age_s = static_cast<double>(cmd_age_ns) / 1e9;
         if (cmd_age_s > cfg_.command_timeout_s) {
@@ -561,7 +720,21 @@ void RtControlLoop::rt_thread_func() {
             }
         }
 
-        // 6. Gravity compensation
+        // 7. Slew rate limiting
+        for (int i = 0; i < 6; ++i) {
+            double max_delta = cfg_.max_pos_delta_per_cycle[static_cast<size_t>(i)];
+            if (max_delta > 0.0) {
+                double diff = cmd.q_des[static_cast<size_t>(i)] - slew_target_[static_cast<size_t>(i)];
+                if (diff > max_delta) diff = max_delta;
+                else if (diff < -max_delta) diff = -max_delta;
+                slew_target_[static_cast<size_t>(i)] += diff;
+            } else {
+                // Rate limiting disabled for this joint — pass through
+                slew_target_[static_cast<size_t>(i)] = cmd.q_des[static_cast<size_t>(i)];
+            }
+        }
+
+        // 8. Gravity compensation
         std::array<double, 6> tau_ff = {};
         if (grav_comp_.is_loaded()) {
             grav_comp_.compute(cur_pos.data(), tau_ff.data());
@@ -570,20 +743,22 @@ void RtControlLoop::rt_thread_func() {
             }
         }
 
-        // 7. Safety
+        // 9. Safety (uses slew-limited target, not raw q_des)
         std::array<double, 6> kp = cfg_.default_kp;
         std::array<double, 6> q_des;
-        std::copy(cmd.q_des.begin(), cmd.q_des.end(), q_des.begin());
-        apply_safety(cur_pos.data(), cur_torque.data(),
+        std::copy(slew_target_.begin(), slew_target_.end(), q_des.begin());
+        apply_safety(cur_pos.data(), cur_vel.data(), cur_torque.data(),
                      q_des.data(), kp.data(), tau_ff.data(),
                      pos_lo.data(), pos_hi.data(),
-                     cfg_.joint_torque_limits.data(), cfg_.limit_buffer,
-                     cfg_.overcurrent_threshold, 6, safety_state_);
+                     cfg_.joint_torque_limits.data(), cfg_.joint_velocity_limits.data(),
+                     cfg_.limit_buffer,
+                     cfg_.overcurrent_threshold, cfg_.overspeed_threshold,
+                     6, safety_state_);
 
-        if (cmd_age_s < 0.01 && safety_state_.damping_mode) {
-            safety_state_.damping_mode = false;
-            safety_state_.overcurrent_count = 0;
-        }
+        // Update health with safety state
+        health_rt_.damping_mode = safety_state_.damping_mode;
+        health_rt_.overcurrent_count = safety_state_.overcurrent_count;
+        health_rt_.overspeed_count = safety_state_.overspeed_count;
 
         if (debug) {
             std::fprintf(stderr, "  [cycle %llu] q_des=[", (unsigned long long)loop_count);
@@ -595,37 +770,74 @@ void RtControlLoop::rt_thread_func() {
             std::fprintf(stderr, "] cmd_age=%.3fs\n", cmd_age_s);
         }
 
-        // 8. Send all commands in a burst (goes to kernel TX buffer, fast)
-        for (size_t i = 0; i < 6 && i < cfg_.motors.size(); ++i) {
-            const auto& m = cfg_.motors[i];
-            const auto& lim = get_limits(m.type);
-            build_mit_frame(tx_frame, m.slave_id,
-                           static_cast<float>(kp[i]),
-                           static_cast<float>(cfg_.default_kd[i]),
-                           static_cast<float>(q_des[i]),
-                           0.0f,
-                           static_cast<float>(tau_ff[i]),
-                           lim);
-            serial_.write(tx_frame, 30);
+        // 10. Send commands — gated by comm error state
+        if (health_rt_.comm_loss) {
+            if (cfg_.comm_loss_action == CommLossAction::DISABLE && !comm_error_disable_sent) {
+                // Send disable frames ONCE when first entering error state
+                for (size_t i = 0; i < cfg_.motors.size(); ++i) {
+                    build_disable_frame(tx_frame, cfg_.motors[i].slave_id);
+                    if (!serial_.write(tx_frame, 30)) {
+                        ++health_rt_.total_write_errors;
+                    }
+                    ++health_rt_.total_tx_frames;
+                }
+                comm_error_disable_sent = true;
+            } else if (cfg_.comm_loss_action == CommLossAction::HOLD) {
+                // Send MIT with kp=0 (damping only) to gently decelerate
+                for (size_t i = 0; i < 6 && i < cfg_.motors.size(); ++i) {
+                    const auto& m = cfg_.motors[i];
+                    const auto& lim = get_limits(m.type);
+                    build_mit_frame(tx_frame, m.slave_id,
+                                   0.0f,  // kp = 0
+                                   static_cast<float>(cfg_.default_kd[i]),
+                                   static_cast<float>(cur_pos[i]),
+                                   0.0f, 0.0f, lim);
+                    if (!serial_.write(tx_frame, 30)) {
+                        ++health_rt_.total_write_errors;
+                    }
+                    ++health_rt_.total_tx_frames;
+                }
+            }
+            // In DISABLE mode after first cycle: send nothing (motors already disabled)
+        } else {
+            // Normal operation — send MIT frames for arm joints
+            for (size_t i = 0; i < 6 && i < cfg_.motors.size(); ++i) {
+                const auto& m = cfg_.motors[i];
+                const auto& lim = get_limits(m.type);
+                build_mit_frame(tx_frame, m.slave_id,
+                               static_cast<float>(kp[i]),
+                               static_cast<float>(cfg_.default_kd[i]),
+                               static_cast<float>(q_des[i]),
+                               0.0f,
+                               static_cast<float>(tau_ff[i]),
+                               lim);
+                if (!serial_.write(tx_frame, 30)) {
+                    ++health_rt_.total_write_errors;
+                }
+                ++health_rt_.total_tx_frames;
+            }
+
+            if (cfg_.motors.size() >= 7) {
+                const auto& gm = cfg_.motors[6];
+                double gripper_q = gripper_open_pos_ +
+                    cmd.gripper_des * (cfg_.gripper_closed_pos - gripper_open_pos_);
+                build_emit_frame(tx_frame, gm.slave_id,
+                                static_cast<float>(gripper_q),
+                                static_cast<float>(gripper_vel_emit),
+                                static_cast<float>(gripper_i_des_emit));
+                if (!serial_.write(tx_frame, 30)) {
+                    ++health_rt_.total_write_errors;
+                }
+                ++health_rt_.total_tx_frames;
+            }
         }
 
-        if (cfg_.motors.size() >= 7) {
-            const auto& gm = cfg_.motors[6];
-            double gripper_q = gripper_open_pos_ +
-                cmd.gripper_des * (cfg_.gripper_closed_pos - gripper_open_pos_);
-            build_emit_frame(tx_frame, gm.slave_id,
-                            static_cast<float>(gripper_q),
-                            static_cast<float>(gripper_vel_emit),
-                            static_cast<float>(gripper_i_des_emit));
-            serial_.write(tx_frame, 30);
-        }
-
-        // 9. Record perf
+        // 11. Record perf
         uint64_t t1 = now_ns();
         double cycle_us = static_cast<double>(t1 - t0) / 1000.0;
         perf_.record(cycle_us, target_us);
 
-        // 10. Sleep to next period
+        // 12. Sleep to next period
         next_wakeup += period_ns;
         if (next_wakeup < t1) {
             next_wakeup = t1 + period_ns;

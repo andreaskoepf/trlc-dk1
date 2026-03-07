@@ -7,6 +7,8 @@
 #include <cstring>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
+#include <time.h>
 
 namespace trlc {
 
@@ -25,6 +27,19 @@ public:
 
     // Called by RT thread each cycle
     void record(double cycle_us, double target_us) {
+        // Handle reset request from non-RT thread (deferred to RT thread to avoid data race)
+        if (reset_requested_.load(std::memory_order_acquire)) {
+            reset_requested_.store(false, std::memory_order_relaxed);
+            stats_ = PerfSnapshot{};
+            sum_ = 0.0;
+            uint64_t s = seq_.load(std::memory_order_relaxed);
+            seq_.store(s + 1, std::memory_order_release);
+            snap_ = PerfSnapshot{};
+            seq_.store(s + 2, std::memory_order_release);
+            ring_head_.store(0, std::memory_order_release);
+            reset_ack_.fetch_add(1, std::memory_order_release);
+        }
+
         // Update running stats
         ++stats_.loop_count;
         if (cycle_us < stats_.min_cycle_us) stats_.min_cycle_us = cycle_us;
@@ -90,14 +105,19 @@ public:
         return 0;
     }
 
-    void reset() {
-        stats_ = PerfSnapshot{};
-        sum_ = 0.0;
-        uint64_t s = seq_.load(std::memory_order_relaxed);
-        seq_.store(s + 1, std::memory_order_release);
-        snap_ = PerfSnapshot{};
-        seq_.store(s + 2, std::memory_order_release);
-        ring_head_.store(0, std::memory_order_release);
+    // Request reset (processed by RT thread on next record() call).
+    // Blocks until the RT thread has processed the reset, with a timeout.
+    // Throws std::runtime_error if the RT thread does not process the reset in time.
+    void reset(int timeout_ms = 100) {
+        uint64_t before = reset_ack_.load(std::memory_order_acquire);
+        reset_requested_.store(true, std::memory_order_release);
+        if (timeout_ms <= 0) return;  // fire-and-forget
+        for (int waited = 0; waited < timeout_ms; ++waited) {
+            if (reset_ack_.load(std::memory_order_acquire) != before) return;
+            struct timespec ts = {0, 1000000};  // 1ms
+            nanosleep(&ts, nullptr);
+        }
+        throw std::runtime_error("PerfCounters::reset() timed out waiting for RT thread acknowledgment");
     }
 
 private:
@@ -113,6 +133,10 @@ private:
     static constexpr size_t RING_SIZE = 16384;
     alignas(64) std::array<float, RING_SIZE> ring_{};
     alignas(64) std::atomic<uint64_t> ring_head_{0};
+
+    // Reset coordination (Python sets, RT thread consumes and acks)
+    std::atomic<bool> reset_requested_{false};
+    std::atomic<uint64_t> reset_ack_{0};
 };
 
 } // namespace trlc

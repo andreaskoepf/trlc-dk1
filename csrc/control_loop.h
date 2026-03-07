@@ -16,6 +16,11 @@
 
 namespace trlc {
 
+enum class CommLossAction : int {
+    HOLD = 0,     // Send MIT with kp=0 (damping only) — motors gently brake
+    DISABLE = 1,  // Send disable frames to all motors — motors go limp
+};
+
 struct RtLoopConfig {
     std::string serial_port = "/dev/ttyACM0";
     double loop_hz = 250.0;
@@ -35,6 +40,7 @@ struct RtLoopConfig {
         -3.14159265, 3.14159265,   // joint_6
     };
     std::array<double, 6> joint_torque_limits = {28, 28, 28, 10, 10, 10};
+    std::array<double, 6> joint_velocity_limits = {5.0, 5.0, 5.0, 15.0, 15.0, 15.0};
     double limit_buffer = 0.05;
 
     std::string model_path;  // URDF/XML for gravity comp, empty = disabled
@@ -42,6 +48,10 @@ struct RtLoopConfig {
 
     double command_timeout_s = 0.5;
     int overcurrent_threshold = 20;
+    int overspeed_threshold = 5;
+
+    // Motor initialization
+    int min_motors_required = 6;          // throw if fewer arm motors respond
 
     // Gripper
     double gripper_open_pos = 0.0;
@@ -50,6 +60,17 @@ struct RtLoopConfig {
     double torque_constant = 0.945;
     double emit_velocity_scale = 100.0;
     double emit_current_scale = 1000.0;
+    double gripper_cal_timeout_s = 10.0;  // wall-clock timeout for calibration
+
+    // Slew rate limiting (max position change per cycle in radians)
+    // At 250 Hz, 0.01 rad/cycle = 2.5 rad/s max slew rate.
+    // Set to 0.0 to disable rate limiting for a joint.
+    std::array<double, 6> max_pos_delta_per_cycle = {0.02, 0.02, 0.02, 0.06, 0.06, 0.06};
+
+    // Communication loss detection
+    int max_consecutive_empty_cycles = 50;  // 50 cycles = 200ms at 250Hz
+    CommLossAction comm_loss_action = CommLossAction::DISABLE;
+    int per_motor_stale_threshold = 100;    // flag motor after 100 cycles (~400ms)
 
     // Shutdown
     bool disable_torque_on_disconnect = true;
@@ -71,6 +92,25 @@ struct GripperState {
     double torque = 0.0;
 };
 
+struct HealthState {
+    // Safety
+    bool damping_mode = false;
+    int overcurrent_count = 0;
+    int overspeed_count = 0;
+
+    // Communication
+    bool comm_loss = false;
+    int consecutive_empty_cycles = 0;
+    uint64_t total_rx_bytes = 0;
+    uint64_t total_tx_frames = 0;
+    uint64_t total_write_errors = 0;
+    std::array<uint64_t, 7> motor_last_seen_cycle = {};
+    std::array<bool, 7> motor_stale = {};
+
+    // Loop metadata
+    uint64_t loop_count = 0;
+};
+
 class RtControlLoop {
 public:
     explicit RtControlLoop(const RtLoopConfig& cfg);
@@ -90,10 +130,19 @@ public:
     JointState get_joint_state() const;
     GripperState get_gripper_state() const;
 
+    // Health and error state (lock-free read via seqlock)
+    HealthState get_health() const;
+
+    // Reset safety errors (damping mode, overcurrent, overspeed, comm loss).
+    // Blocks until the RT thread processes the reset, with a timeout.
+    // Throws std::runtime_error if not acknowledged within timeout_ms.
+    // Pass timeout_ms=0 for fire-and-forget (non-blocking).
+    void reset_errors(int timeout_ms = 100);
+
     // Diagnostics
     PerfSnapshot get_perf() const;
     size_t read_cycle_times(float* buf, size_t max) const;
-    void reset_perf();
+    void reset_perf(int timeout_ms = 100);
     bool is_running() const { return running_.load(std::memory_order_acquire); }
     bool is_rt_active() const { return rt_active_; }
 
@@ -130,12 +179,26 @@ private:
     alignas(64) StateBuffer state_buf_;
     alignas(64) std::atomic<uint64_t> state_seq_{0};
 
+    // Health seqlock (RT writes, Python reads)
+    alignas(64) HealthState health_buf_;
+    alignas(64) std::atomic<uint64_t> health_seq_{0};
+
+    // RT-thread-only mutable health tracking
+    HealthState health_rt_;
+
+    // Error reset coordination (Python sets, RT thread increments ack after processing)
+    std::atomic<bool> error_reset_requested_{false};
+    std::atomic<uint64_t> error_reset_ack_{0};
+
     std::atomic<bool> running_{false};
     std::thread thread_;
     bool rt_active_ = false;
 
     // Gripper calibration result
     double gripper_open_pos_ = 0.0;
+
+    // Slew rate limiter state (RT thread only)
+    std::array<double, 6> slew_target_ = {};
 };
 
 } // namespace trlc

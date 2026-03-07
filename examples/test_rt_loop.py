@@ -23,6 +23,8 @@ def make_config(port, hz=250.0, gravity_comp=True, gravity_scale=1.0):
     cfg.serial_port = port
     cfg.loop_hz = hz
     cfg.gravity_comp_scale = gravity_scale
+    cfg.min_motors_required = 6
+    cfg.gripper_cal_timeout_s = 10.0
 
     motor_defs = [
         ("joint_1", MotorType.DM4340, 0x01, 0x11),
@@ -87,8 +89,24 @@ def main():
     print("Step 2: Starting (motor config + gripper calibration)...")
     try:
         loop.start()
-    except Exception as e:
-        print(f"  FAILED: {e}")
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "Motor initialization failed" in error_msg:
+            print(f"  FAILED during motor initialization:\n  {e}")
+            print("\n  Troubleshooting:")
+            print("  1. Check that the power supply is ON")
+            print("  2. Verify the serial port is correct (--port flag)")
+            print("  3. Check CAN bus cable connections")
+        elif "Gripper calibration timed out" in error_msg:
+            print(f"  FAILED during gripper calibration:\n  {e}")
+            print("\n  Troubleshooting:")
+            print("  1. Check that the gripper motor is powered on")
+            print("  2. Ensure the gripper can move freely to its open stop")
+        else:
+            print(f"  FAILED: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"  FAILED (invalid config): {e}")
         sys.exit(1)
     print(f"  OK (RT active: {loop.is_rt_active()})")
 
@@ -125,14 +143,23 @@ def main():
 
                 st = loop.get_joint_state()
                 perf = loop.get_perf()
+                health = loop.get_health()
 
                 pos_err = np.array(st.pos) - hold_pos
+                status_flags = []
+                if health.damping_mode:
+                    status_flags.append("DAMPING")
+                if health.comm_loss:
+                    status_flags.append("COMM_LOSS")
+                status = " [" + ", ".join(status_flags) + "]" if status_flags else ""
+
                 print(
                     f"  [{elapsed:5.1f}s] "
                     f"pos_err(deg)=[{', '.join(f'{np.degrees(e):+5.2f}' for e in pos_err)}]  "
                     f"mean={perf.mean_cycle_us:.0f}us  "
                     f"max={perf.max_cycle_us:.0f}us  "
                     f"misses={perf.deadline_misses}"
+                    f"{status}"
                 )
     except KeyboardInterrupt:
         print("\n  Interrupted.")
@@ -171,8 +198,21 @@ def main():
               f"p95={np.percentile(cycle_times, 95):.0f}us  "
               f"p99={np.percentile(cycle_times, 99):.0f}us")
 
-    # --- Step 7: Stop ---
-    print("Step 7: Stopping...")
+    # --- Step 7: Health summary ---
+    print("Step 7: Health state...")
+    health = loop.get_health()
+    print(f"  Damping mode:    {health.damping_mode}")
+    print(f"  Overcurrent:     {health.overcurrent_count}")
+    print(f"  Overspeed:       {health.overspeed_count}")
+    print(f"  Comm loss:       {health.comm_loss}")
+    print(f"  Empty cycles:    {health.consecutive_empty_cycles}")
+    print(f"  Total RX bytes:  {health.total_rx_bytes}")
+    print(f"  Total TX frames: {health.total_tx_frames}")
+    print(f"  Write errors:    {health.total_write_errors}")
+    print(f"  Motor stale:     {health.motor_stale}")
+
+    # --- Step 8: Stop ---
+    print("Step 8: Stopping...")
     loop.stop()
     print("  Done. All motors disabled.")
 

@@ -81,6 +81,8 @@ class DK1RobotRT:
         rt_cfg.joint_pos_limits = limits.flatten()
 
         rt_cfg.joint_torque_limits = np.asarray(config.joint_torque_limits, dtype=np.float64)
+        rt_cfg.joint_velocity_limits = np.asarray(config.joint_velocity_limits, dtype=np.float64)
+        rt_cfg.max_pos_delta_per_cycle = np.asarray(config.max_pos_delta_per_cycle, dtype=np.float64)
         rt_cfg.limit_buffer = 0.05
 
         # Gravity compensation
@@ -91,6 +93,10 @@ class DK1RobotRT:
         # Safety
         rt_cfg.command_timeout_s = config.command_timeout_s
         rt_cfg.overcurrent_threshold = config.overcurrent_threshold
+        rt_cfg.overspeed_threshold = config.overspeed_threshold
+        rt_cfg.min_motors_required = config.min_motors_required
+        rt_cfg.gripper_cal_timeout_s = config.gripper_cal_timeout_s
+        rt_cfg.max_consecutive_empty_cycles = config.max_consecutive_empty_cycles
 
         # Gripper
         rt_cfg.gripper_open_pos = config.gripper_open_pos

@@ -137,11 +137,16 @@ static void test_reset() {
     pc.record(100.0, 4000.0);
     pc.record(200.0, 4000.0);
 
-    pc.reset();
+    pc.reset(0);  // non-blocking (no RT thread in unit test)
+    // Reset is deferred — the next record() call processes it, then records
+    pc.record(50.0, 4000.0);
 
     auto snap = pc.snapshot();
-    assert(snap.loop_count == 0);
+    // After reset + one new record: loop_count=1, min=50, max=50
+    assert(snap.loop_count == 1);
     assert(snap.deadline_misses == 0);
+    assert(std::abs(snap.min_cycle_us - 50.0) < 0.01);
+    assert(std::abs(snap.max_cycle_us - 50.0) < 0.01);
 
     std::printf("  reset: PASS\n");
 }
