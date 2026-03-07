@@ -90,6 +90,12 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(_trlc_dk1_rt PRIVATE Threads::Threads)
 
+# Set RPATH so the extension can find libmujoco in the mujoco sibling package
+set_target_properties(_trlc_dk1_rt PROPERTIES
+    INSTALL_RPATH "$ORIGIN/../mujoco"
+    BUILD_WITH_INSTALL_RPATH TRUE
+)
+
 # Install the module into the Python package
 install(TARGETS _trlc_dk1_rt LIBRARY DESTINATION trlc_dk1_control)
 
