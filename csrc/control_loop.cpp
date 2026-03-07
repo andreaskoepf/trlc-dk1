@@ -398,7 +398,7 @@ calibration_done:
 // State is one cycle (4ms) behind, which is acceptable for impedance control.
 
 void RtControlLoop::rt_thread_func() {
-    rt_active_ = apply_rt_scheduling(cfg_.rt_priority, cfg_.rt_cpu_affinity, cfg_.rt_use_mlockall);
+    rt_active_ = apply_rt_scheduling(cfg_.rt_priority, cfg_.rt_cpu_affinity, cfg_.rt_use_mlockall, cfg_.loop_hz);
     if (rt_active_) {
         std::fprintf(stderr, "RT scheduling active (SCHED_FIFO priority %d)\n", cfg_.rt_priority);
     } else {
