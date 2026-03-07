@@ -24,7 +24,7 @@ DEFAULT_KP = np.array([80.0, 70.0, 60.0, 20.0, 20.0, 10.0])
 
 
 def make_config(port, hz=250.0, gravity_scale=1.0):
-    from _trlc_dk1_rt import RtLoopConfig, MotorDescriptor, MotorType
+    from trlc_dk1_control._trlc_dk1_rt import RtLoopConfig, MotorDescriptor, MotorType
 
     cfg = RtLoopConfig()
     cfg.serial_port = port
@@ -89,7 +89,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        from _trlc_dk1_rt import RtControlLoop
+        from trlc_dk1_control._trlc_dk1_rt import RtControlLoop
     except ImportError:
         print("Error: C++ RT extension not found. Build it first.")
         sys.exit(1)

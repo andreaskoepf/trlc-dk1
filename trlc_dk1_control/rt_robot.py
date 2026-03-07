@@ -38,7 +38,7 @@ class DK1RobotRT:
 
     def __init__(self, config: DK1RobotConfig) -> None:
         try:
-            from _trlc_dk1_rt import RtControlLoop, RtLoopConfig, MotorDescriptor, MotorType
+            from trlc_dk1_control._trlc_dk1_rt import RtControlLoop, RtLoopConfig, MotorDescriptor, MotorType
         except ImportError as e:
             raise ImportError(
                 "C++ RT extension not available. Install with: "
