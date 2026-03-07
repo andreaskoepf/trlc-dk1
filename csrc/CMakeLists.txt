@@ -42,13 +42,12 @@ if(MUJOCO_RESULT EQUAL 0 AND EXISTS "${MUJOCO_PKG_DIR}")
         NO_DEFAULT_PATH)
 
     if(NOT MUJOCO_LIBRARY)
-        # Look for the shared library in the package directory (.so on Linux, .dylib on macOS)
-        file(GLOB MUJOCO_LIBRARY_GLOB "${MUJOCO_PKG_DIR}/../mujoco.libs/libmujoco*.so*"
-                                       "${MUJOCO_PKG_DIR}/libmujoco*.so*"
-                                       "${MUJOCO_PKG_DIR}/../*.libs/libmujoco*.so*"
-                                       "${MUJOCO_PKG_DIR}/../mujoco.dylibs/libmujoco*.dylib"
+        # Look for the shared library in the package directory
+        # Linux: libmujoco.so.X.Y.Z in mujoco/ or mujoco.libs/
+        # macOS: libmujoco.X.Y.Z.dylib in mujoco/
+        file(GLOB MUJOCO_LIBRARY_GLOB "${MUJOCO_PKG_DIR}/libmujoco*.so*"
                                        "${MUJOCO_PKG_DIR}/libmujoco*.dylib"
-                                       "${MUJOCO_PKG_DIR}/../*.dylibs/libmujoco*.dylib")
+                                       "${MUJOCO_PKG_DIR}/../mujoco.libs/libmujoco*.so*")
         if(MUJOCO_LIBRARY_GLOB)
             list(GET MUJOCO_LIBRARY_GLOB 0 MUJOCO_LIBRARY)
         endif()
@@ -96,12 +95,12 @@ target_link_libraries(_trlc_dk1_rt PRIVATE Threads::Threads)
 # Set RPATH so the extension can find libmujoco in the mujoco sibling package
 if(APPLE)
     set_target_properties(_trlc_dk1_rt PROPERTIES
-        INSTALL_RPATH "@loader_path/../mujoco;@loader_path/../mujoco.dylibs"
+        INSTALL_RPATH "@loader_path/../mujoco"
         BUILD_WITH_INSTALL_RPATH TRUE
     )
 else()
     set_target_properties(_trlc_dk1_rt PROPERTIES
-        INSTALL_RPATH "$ORIGIN/../mujoco;$ORIGIN/../mujoco.libs"
+        INSTALL_RPATH "$ORIGIN/../mujoco"
         BUILD_WITH_INSTALL_RPATH TRUE
     )
 endif()
