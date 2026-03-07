@@ -17,7 +17,7 @@ import numpy as np
 
 
 def make_config(port, hz=250.0, gravity_comp=True, gravity_scale=1.0):
-    from _trlc_dk1_rt import RtLoopConfig, MotorDescriptor, MotorType
+    from trlc_dk1_control._trlc_dk1_rt import RtLoopConfig, MotorDescriptor, MotorType
 
     cfg = RtLoopConfig()
     cfg.serial_port = port
@@ -63,11 +63,10 @@ def main():
     args = parser.parse_args()
 
     try:
-        from _trlc_dk1_rt import RtControlLoop, detect_rt_kernel
+        from trlc_dk1_control._trlc_dk1_rt import RtControlLoop, detect_rt_kernel
     except ImportError:
-        print("Error: C++ RT extension not found. Build it first:")
-        print("  mkdir build-ext && cd build-ext && cmake ../csrc -DCMAKE_BUILD_TYPE=Release && cmake --build . -j$(nproc)")
-        print("  cp build-ext/_trlc_dk1_rt*.so .")
+        print("Error: C++ RT extension not found. Reinstall the package:")
+        print("  uv sync --reinstall-package lerobot-robot-trlc-dk1")
         sys.exit(1)
 
     print(f"RT kernel: {detect_rt_kernel()}")
