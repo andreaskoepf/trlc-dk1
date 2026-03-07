@@ -9,6 +9,10 @@
 #include <stdexcept>
 #include <time.h>
 
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+
 namespace trlc {
 
 static uint64_t now_ns() {
@@ -18,10 +22,19 @@ static uint64_t now_ns() {
 }
 
 static void sleep_until_ns(uint64_t target_ns) {
+#ifdef __APPLE__
+    // macOS lacks clock_nanosleep; use mach_wait_until for absolute sleep
+    static mach_timebase_info_data_t tb = {};
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    // Convert wall-clock ns to mach absolute time units
+    uint64_t mach_target = target_ns * tb.denom / tb.numer;
+    mach_wait_until(mach_target);
+#else
     struct timespec ts;
     ts.tv_sec = static_cast<time_t>(target_ns / 1000000000ULL);
     ts.tv_nsec = static_cast<long>(target_ns % 1000000000ULL);
     clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
+#endif
 }
 
 static void sleep_ms(int ms) {

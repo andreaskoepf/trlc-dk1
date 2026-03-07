@@ -45,6 +45,10 @@ bool SerialPort::open(const std::string& device, int baudrate) {
         case 57600:   baud = B57600;   break;
         case 115200:  baud = B115200;  break;
         case 230400:  baud = B230400;  break;
+#ifdef __APPLE__
+        // macOS uses the numeric value directly for non-POSIX baud rates
+        default:      baud = static_cast<speed_t>(baudrate); break;
+#else
         case 460800:  baud = B460800;  break;
         case 500000:  baud = B500000;  break;
         case 576000:  baud = B576000;  break;
@@ -55,6 +59,7 @@ bool SerialPort::open(const std::string& device, int baudrate) {
             ::close(fd_);
             fd_ = -1;
             return false;
+#endif
     }
 
     cfsetispeed(&tty, baud);
