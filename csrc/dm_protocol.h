@@ -213,6 +213,12 @@ public:
     // Feed raw bytes, extract complete 16-byte packets
     void feed(const uint8_t* data, size_t len) {
         residual_.insert(residual_.end(), data, data + len);
+        // Cap residual buffer to prevent unbounded growth from corrupted data
+        if (residual_.size() > MAX_RESIDUAL) {
+            size_t excess = residual_.size() - MAX_RESIDUAL;
+            residual_.erase(residual_.begin(),
+                           residual_.begin() + static_cast<ptrdiff_t>(excess));
+        }
     }
 
     // Extract all complete packets from the residual buffer
@@ -220,7 +226,6 @@ public:
     size_t extract(std::vector<std::array<uint8_t, RX_PACKET_LEN>>& out) {
         size_t count = 0;
         size_t i = 0;
-        size_t remainder_pos = 0;
 
         while (i + RX_PACKET_LEN <= residual_.size()) {
             if (residual_[i] == RX_HEADER &&
@@ -229,17 +234,17 @@ public:
                 std::memcpy(pkt.data(), residual_.data() + i, RX_PACKET_LEN);
                 out.push_back(pkt);
                 i += RX_PACKET_LEN;
-                remainder_pos = i;
                 ++count;
             } else {
                 ++i;
             }
         }
 
-        // Keep unprocessed bytes
-        if (remainder_pos > 0) {
+        // Erase all scanned bytes (both junk and extracted packets).
+        // Only trailing bytes (< RX_PACKET_LEN) that may be a partial packet remain.
+        if (i > 0) {
             residual_.erase(residual_.begin(),
-                           residual_.begin() + static_cast<ptrdiff_t>(remainder_pos));
+                           residual_.begin() + static_cast<ptrdiff_t>(i));
         }
         return count;
     }
@@ -247,6 +252,7 @@ public:
     void clear() { residual_.clear(); }
 
 private:
+    static constexpr size_t MAX_RESIDUAL = 4096;
     std::vector<uint8_t> residual_;
 };
 

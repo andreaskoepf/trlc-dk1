@@ -73,9 +73,26 @@ class DK1RobotConfig:
     mjcf_path: str = _DEFAULT_URDF   # path to MuJoCo XML; empty = gravity comp disabled
     gravity_comp_scale: float = 1.0  # tune empirically
 
+    # Joint velocity limits (rad/s) per joint — operational safety limit
+    joint_velocity_limits: np.ndarray = field(
+        default_factory=lambda: np.array([5.0, 5.0, 5.0, 15.0, 15.0, 15.0])
+    )
+
+    # Slew rate limit: max position change per cycle (rad/cycle) per joint
+    # At 250 Hz: 0.02 rad/cycle = 5 rad/s, 0.06 rad/cycle = 15 rad/s. 0.0 disables.
+    max_pos_delta_per_cycle: np.ndarray = field(
+        default_factory=lambda: np.array([0.02, 0.02, 0.02, 0.06, 0.06, 0.06])
+    )
+
     # Safety watchdog
     command_timeout_s: float = 0.5    # hold position (damping only) after this idle period
     overcurrent_threshold: int = 20   # consecutive over-limit torque counts before damping
+    overspeed_threshold: int = 5      # consecutive over-limit velocity counts before damping
+    min_motors_required: int = 6      # throw if fewer arm motors respond during init
+    gripper_cal_timeout_s: float = 10.0  # wall-clock timeout for gripper calibration
+
+    # Communication loss detection
+    max_consecutive_empty_cycles: int = 50  # cycles with 0 bytes before comm loss (200ms at 250Hz)
 
     # Shutdown
     disable_torque_on_disconnect: bool = True

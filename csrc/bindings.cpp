@@ -28,6 +28,11 @@ NB_MODULE(_trlc_dk1_rt, m) {
         .value("DMH6215", MotorType::DMH6215)
         .value("DMG6220", MotorType::DMG6220);
 
+    // CommLossAction enum
+    nb::enum_<CommLossAction>(m, "CommLossAction")
+        .value("HOLD", CommLossAction::HOLD)
+        .value("DISABLE", CommLossAction::DISABLE);
+
     // MotorDescriptor
     nb::class_<MotorDescriptor>(m, "MotorDescriptor")
         .def(nb::init<>())
@@ -60,16 +65,22 @@ NB_MODULE(_trlc_dk1_rt, m) {
         .def_rw("gravity_comp_scale", &RtLoopConfig::gravity_comp_scale)
         .def_rw("command_timeout_s", &RtLoopConfig::command_timeout_s)
         .def_rw("overcurrent_threshold", &RtLoopConfig::overcurrent_threshold)
+        .def_rw("overspeed_threshold", &RtLoopConfig::overspeed_threshold)
+        .def_rw("min_motors_required", &RtLoopConfig::min_motors_required)
         .def_rw("gripper_open_pos", &RtLoopConfig::gripper_open_pos)
         .def_rw("gripper_closed_pos", &RtLoopConfig::gripper_closed_pos)
         .def_rw("max_gripper_torque_nm", &RtLoopConfig::max_gripper_torque_nm)
         .def_rw("torque_constant", &RtLoopConfig::torque_constant)
         .def_rw("emit_velocity_scale", &RtLoopConfig::emit_velocity_scale)
         .def_rw("emit_current_scale", &RtLoopConfig::emit_current_scale)
+        .def_rw("gripper_cal_timeout_s", &RtLoopConfig::gripper_cal_timeout_s)
         .def_rw("disable_torque_on_disconnect", &RtLoopConfig::disable_torque_on_disconnect)
         .def_rw("rt_priority", &RtLoopConfig::rt_priority)
         .def_rw("rt_cpu_affinity", &RtLoopConfig::rt_cpu_affinity)
         .def_rw("rt_use_mlockall", &RtLoopConfig::rt_use_mlockall)
+        .def_rw("max_consecutive_empty_cycles", &RtLoopConfig::max_consecutive_empty_cycles)
+        .def_rw("comm_loss_action", &RtLoopConfig::comm_loss_action)
+        .def_rw("per_motor_stale_threshold", &RtLoopConfig::per_motor_stale_threshold)
         // std::array properties exposed via lambdas for numpy compatibility
         .def_prop_rw("default_kp",
             [](const RtLoopConfig& c) {
@@ -106,6 +117,24 @@ NB_MODULE(_trlc_dk1_rt, m) {
             [](RtLoopConfig& c, nb::ndarray<nb::numpy, const double, nb::shape<6>> arr) {
                 const double* p = arr.data();
                 for (int i = 0; i < 6; ++i) c.joint_torque_limits[static_cast<size_t>(i)] = p[i];
+            })
+        .def_prop_rw("joint_velocity_limits",
+            [](const RtLoopConfig& c) {
+                return nb::ndarray<nb::numpy, const double, nb::shape<6>>(
+                    c.joint_velocity_limits.data(), {6});
+            },
+            [](RtLoopConfig& c, nb::ndarray<nb::numpy, const double, nb::shape<6>> arr) {
+                const double* p = arr.data();
+                for (int i = 0; i < 6; ++i) c.joint_velocity_limits[static_cast<size_t>(i)] = p[i];
+            })
+        .def_prop_rw("max_pos_delta_per_cycle",
+            [](const RtLoopConfig& c) {
+                return nb::ndarray<nb::numpy, const double, nb::shape<6>>(
+                    c.max_pos_delta_per_cycle.data(), {6});
+            },
+            [](RtLoopConfig& c, nb::ndarray<nb::numpy, const double, nb::shape<6>> arr) {
+                const double* p = arr.data();
+                for (int i = 0; i < 6; ++i) c.max_pos_delta_per_cycle[static_cast<size_t>(i)] = p[i];
             });
 
     // JointState
@@ -125,6 +154,28 @@ NB_MODULE(_trlc_dk1_rt, m) {
         .def_ro("pos", &GripperState::pos)
         .def_ro("torque", &GripperState::torque);
 
+    // HealthState
+    nb::class_<HealthState>(m, "HealthState")
+        .def(nb::init<>())
+        .def_ro("damping_mode", &HealthState::damping_mode)
+        .def_ro("overcurrent_count", &HealthState::overcurrent_count)
+        .def_ro("overspeed_count", &HealthState::overspeed_count)
+        .def_ro("comm_loss", &HealthState::comm_loss)
+        .def_ro("consecutive_empty_cycles", &HealthState::consecutive_empty_cycles)
+        .def_ro("total_rx_bytes", &HealthState::total_rx_bytes)
+        .def_ro("total_tx_frames", &HealthState::total_tx_frames)
+        .def_ro("total_write_errors", &HealthState::total_write_errors)
+        .def_ro("loop_count", &HealthState::loop_count)
+        .def_prop_ro("motor_last_seen_cycle", [](const HealthState& h) {
+            return nb::ndarray<nb::numpy, const uint64_t, nb::shape<7>>(
+                h.motor_last_seen_cycle.data(), {7});
+        })
+        .def_prop_ro("motor_stale", [](const HealthState& h) {
+            nb::list result;
+            for (int i = 0; i < 7; ++i) result.append(h.motor_stale[i]);
+            return result;
+        });
+
     // RtControlLoop
     nb::class_<RtControlLoop>(m, "RtControlLoop")
         .def(nb::init<const RtLoopConfig&>())
@@ -137,6 +188,8 @@ NB_MODULE(_trlc_dk1_rt, m) {
         .def("command_gripper", &RtControlLoop::command_gripper)
         .def("get_joint_state", &RtControlLoop::get_joint_state)
         .def("get_gripper_state", &RtControlLoop::get_gripper_state)
+        .def("get_health", &RtControlLoop::get_health)
+        .def("reset_errors", &RtControlLoop::reset_errors, nb::arg("timeout_ms") = 100)
         .def("get_perf", &RtControlLoop::get_perf)
         .def("read_cycle_times", [](const RtControlLoop& loop, size_t max_count) {
             std::vector<float> buf(max_count);
@@ -148,7 +201,7 @@ NB_MODULE(_trlc_dk1_rt, m) {
             nb::capsule owner(data, [](void* p) noexcept { delete[] static_cast<float*>(p); });
             return nb::ndarray<nb::numpy, float>(data, {n}, owner);
         })
-        .def("reset_perf", &RtControlLoop::reset_perf)
+        .def("reset_perf", &RtControlLoop::reset_perf, nb::arg("timeout_ms") = 100)
         .def("is_running", &RtControlLoop::is_running)
         .def("is_rt_active", &RtControlLoop::is_rt_active);
 

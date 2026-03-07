@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -45,7 +46,11 @@ inline constexpr std::array<MotorLimits, 12> MOTOR_LIMITS = {{
 }};
 
 inline const MotorLimits& get_limits(MotorType type) {
-    return MOTOR_LIMITS[static_cast<int>(type)];
+    int idx = static_cast<int>(type);
+    if (idx < 0 || idx >= static_cast<int>(MOTOR_LIMITS.size())) {
+        throw std::out_of_range("Invalid MotorType index: " + std::to_string(idx));
+    }
+    return MOTOR_LIMITS[static_cast<size_t>(idx)];
 }
 
 struct MotorDescriptor {

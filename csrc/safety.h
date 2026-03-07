@@ -9,16 +9,19 @@ namespace trlc {
 struct SafetyState {
     bool damping_mode = false;
     int overcurrent_count = 0;
+    int overspeed_count = 0;
 };
 
 // Apply safety checks, modifying q_des, kp, and tau_ff in-place.
 // ndof: number of joints (typically 6)
 inline void apply_safety(
-    const double* pos, const double* torque,
+    const double* pos, const double* vel, const double* torque,
     double* q_des, double* kp, double* tau_ff,
     const double* pos_limits_lo, const double* pos_limits_hi,
-    const double* torque_limits, double limit_buffer,
-    int overcurrent_threshold, int ndof,
+    const double* torque_limits, const double* velocity_limits,
+    double limit_buffer,
+    int overcurrent_threshold, int overspeed_threshold,
+    int ndof,
     SafetyState& state)
 {
     // Position clamping with buffer
@@ -31,6 +34,24 @@ inline void apply_safety(
     // Torque limit clipping
     for (int i = 0; i < ndof; ++i) {
         tau_ff[i] = std::clamp(tau_ff[i], -torque_limits[i], torque_limits[i]);
+    }
+
+    // Over-speed detection
+    bool any_overspeed = false;
+    for (int i = 0; i < ndof; ++i) {
+        if (std::abs(vel[i]) > velocity_limits[i]) {
+            any_overspeed = true;
+            break;
+        }
+    }
+
+    if (any_overspeed) {
+        ++state.overspeed_count;
+        if (state.overspeed_count >= overspeed_threshold) {
+            state.damping_mode = true;
+        }
+    } else {
+        state.overspeed_count = std::max(0, state.overspeed_count - 1);
     }
 
     // Over-current detection
