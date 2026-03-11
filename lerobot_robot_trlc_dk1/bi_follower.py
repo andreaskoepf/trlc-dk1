@@ -82,9 +82,9 @@ class BiDK1Follower(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        return {f"left_{motor}.pos": float for motor in self.left_arm.motors} | {
-            f"right_{motor}.pos": float for motor in self.right_arm.motors
-        }
+        left_ft = {f"left_{k}": v for k, v in self.left_arm.action_features.items()}
+        right_ft = {f"right_{k}": v for k, v in self.right_arm.action_features.items()}
+        return {**left_ft, **right_ft}
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -94,7 +94,9 @@ class BiDK1Follower(Robot):
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-        return {**self._motors_ft, **self._cameras_ft}
+        left_obs = {f"left_{k}": v for k, v in self.left_arm.observation_features.items()}
+        right_obs = {f"right_{k}": v for k, v in self.right_arm.observation_features.items()}
+        return {**left_obs, **right_obs, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
