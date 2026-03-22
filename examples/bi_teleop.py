@@ -6,10 +6,21 @@ Usage:
     python examples/bi_teleop.py [--mode rt_impedance] [--gravity-scale 1.0] [--hz 200]
 """
 import argparse
+import signal
 import time
 
 from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower, BiDK1FollowerConfig
 from lerobot_robot_trlc_dk1.bi_leader import BiDK1Leader, BiDK1LeaderConfig
+
+_stop_requested = False
+
+
+def _sigint_handler(signum, frame):
+    global _stop_requested
+    if _stop_requested:
+        # Second Ctrl+C — force exit
+        raise KeyboardInterrupt
+    _stop_requested = True
 
 
 def main():
@@ -55,10 +66,30 @@ def main():
     print()
     print("Bimanual teleop running — move the leader arms. Press Ctrl+C to stop.")
 
+    # Use signal handler so Ctrl+C sets a flag instead of interrupting
+    # mid-serial-transaction.  This lets the current read/write finish
+    # cleanly before we shut down.
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    def _arm_stats(arm, label):
+        if arm._robot is None:
+            return ""
+        state = arm._robot.get_joint_state()
+        grip = arm._robot.get_gripper_state()
+        perf = arm._robot.get_perf() if hasattr(arm._robot, 'get_perf') else None
+        tau = state["torque"]
+        tau_str = " ".join(f"{t:+5.1f}" for t in tau)
+        grip_str = f"{grip['torque']:+5.2f}"
+        perf_str = ""
+        if perf is not None:
+            perf_str = (f"  | RT: {perf.mean_cycle_us:.0f}/{perf.max_cycle_us:.0f}us"
+                        f" miss={perf.deadline_misses}")
+        return f"  {label} tau: {tau_str}  grip:{grip_str}{perf_str}"
+
     has_rt = args.mode in ("impedance", "rt_impedance")
+    last_print_time = time.monotonic()
     try:
-        last_print_time = time.monotonic()
-        while True:
+        while not _stop_requested:
             action = leader.get_action()
             follower.send_action(action)
             time.sleep(1.0 / args.hz)
@@ -66,29 +97,29 @@ def main():
             now = time.monotonic()
             if now - last_print_time >= 1.0 and has_rt:
                 last_print_time = now
-
-                def _arm_stats(arm, label):
-                    if arm._robot is None:
-                        return ""
-                    state = arm._robot.get_joint_state()
-                    grip = arm._robot.get_gripper_state()
-                    perf = arm._robot.get_perf()
-                    tau = state["torque"]
-                    tau_str = " ".join(f"{t:+5.1f}" for t in tau)
-                    grip_str = f"{grip['torque']:+5.2f}"
-                    perf_str = ""
-                    if perf is not None:
-                        perf_str = (f"  | RT: {perf.mean_cycle_us:.0f}/{perf.max_cycle_us:.0f}us"
-                                    f" miss={perf.deadline_misses}")
-                    return f"  {label} tau: {tau_str}  grip:{grip_str}{perf_str}"
-
                 print(_arm_stats(follower.left_arm, " L"))
                 print(_arm_stats(follower.right_arm, "R"))
-    except KeyboardInterrupt:
-        print("\nStopping teleop...")
+    except (KeyboardInterrupt, OSError):
+        pass  # SIGINT during C-level I/O or broken pipe — fall through to cleanup
 
-    leader.disconnect()
-    follower.disconnect()
+    print("\nStopping teleop...")
+
+    # Followers: stop the RT loop (fast — sets flag and joins RT thread).
+    # The RT loop's stop() sends motor disable frames internally.
+    for arm in [follower.left_arm, follower.right_arm]:
+        if hasattr(arm, '_robot') and arm._robot is not None:
+            try:
+                arm._robot.disconnect()
+            except Exception as e:
+                print(f"  Follower disconnect error: {e}")
+
+    # Leaders: close the serial port directly — no Dynamixel writes.
+    for arm in [leader.left_arm, leader.right_arm]:
+        try:
+            arm.bus.port_handler.ser.close()
+        except Exception:
+            pass
+
     print("Done.")
 
 

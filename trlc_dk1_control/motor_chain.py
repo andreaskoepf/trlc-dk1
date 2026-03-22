@@ -218,7 +218,7 @@ class DK1MotorChain:
 
         self._control.switchControlMode(gripper, Control_Type.VEL)
         self._control.enable(gripper)
-        self._control.control_Vel(gripper, 10.0)
+        self._control.control_Vel(gripper, 5.0)  # gentle homing speed
 
         while True:
             self._control.refresh_motor_status(gripper)
@@ -231,7 +231,10 @@ class DK1MotorChain:
                 break
             time.sleep(0.01)
 
-        self.gripper_open_pos = gripper.getPosition()
+        # Back off slightly from the hard stop so the open position is force-free.
+        # After set_zero the encoder is 0 at the stop; open_pos is a small offset
+        # in the close direction (negative).
+        self.gripper_open_pos = self._config.gripper_open_pos
 
         # Switch to EMIT (Torque_Pos) mode for force-controlled grasping
         self._control.switchControlMode(gripper, Control_Type.Torque_Pos)

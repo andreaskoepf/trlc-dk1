@@ -98,7 +98,7 @@ class DK1RobotConfig:
     disable_torque_on_disconnect: bool = True
 
     # Gripper parameters
-    gripper_open_pos: float = 0.0     # rad (set by auto-calibration at startup)
+    gripper_open_pos: float = 0.0     # rad offset from hard stop after calibration
     gripper_closed_pos: float = -4.7  # rad
     max_gripper_torque_nm: float = 1.0
     DM4310_TORQUE_CONSTANT: float = 0.945  # Nm/A

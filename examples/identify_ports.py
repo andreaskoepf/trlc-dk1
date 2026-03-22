@@ -45,10 +45,10 @@ def get_serial_paths() -> set[str]:
 
 
 def get_camera_paths() -> set[str]:
-    """Get current camera by-path symlinks (excluding usbv3 duplicates and metadata nodes)."""
+    """Get current camera by-path symlinks (excluding usbvN duplicates and metadata nodes)."""
     return {
         p for p in glob.glob("/dev/v4l/by-path/*")
-        if "usbv3-" not in p and "video-index0" in p
+        if "-usbv" not in p and "video-index0" in p
     }
 
 

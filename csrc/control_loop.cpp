@@ -126,16 +126,18 @@ void RtControlLoop::stop() {
     uint8_t rx_buf[256];
 
     // Drain any pending data from the serial buffer
-    sleep_ms(50);
     while (serial_.read_all(rx_buf, sizeof(rx_buf)) > 0) {}
 
-    // Disable all motors (arm + gripper) with 100ms delay between each
+    // Disable all motors — send all frames back-to-back without waiting
+    // for individual responses.  The motors will process the disable
+    // commands regardless of whether we read the acks.
     if (cfg_.disable_torque_on_disconnect) {
         for (const auto& m : cfg_.motors) {
             build_disable_frame(frame, m.slave_id);
-            send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
-            sleep_ms(100);
+            serial_.write(frame, 30);
         }
+        // Brief pause for the last frame to be transmitted over USB
+        sleep_ms(20);
     }
 
     serial_.close();
@@ -266,13 +268,33 @@ void RtControlLoop::configure_motors() {
 
     // Read initial arm state — retry multiple times to ensure we get all 6 motors
     std::array<bool, 6> got_initial = {};
+    std::array<int, 6> param_resp_count = {};  // track motors stuck returning param responses
     int total_got = 0;
 
-    for (int round = 0; round < 5 && total_got < 6; ++round) {
+    for (int round = 0; round < 8 && total_got < 6; ++round) {
         std::vector<std::array<uint8_t, RX_PACKET_LEN>> packets;
         for (size_t i = 0; i < 6; ++i) {
             if (got_initial[i]) continue;
             const auto& m = cfg_.motors[i];
+
+            // If a motor keeps returning param responses, re-cycle it
+            if (round > 0 && param_resp_count[i] >= 2) {
+                std::fprintf(stderr, "  [init round %d] motor %zu (%s) stuck in param mode — "
+                             "disable/re-enable\n", round, i, m.name.c_str());
+                build_disable_frame(frame, m.slave_id);
+                send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 50000);
+                sleep_ms(50);
+                build_switch_mode_frame(frame, m.slave_id, 1);
+                send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
+                build_enable_frame(frame, m.slave_id);
+                send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
+                sleep_ms(50);
+                // Drain residual param ack packets
+                while (serial_.read_all(rx_buf, sizeof(rx_buf)) > 0) {}
+                parser_.clear();
+                param_resp_count[i] = 0;
+            }
+
             build_refresh_frame(frame, m.slave_id);
             size_t n = send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 10000);
             std::fprintf(stderr, "  [init round %d] refresh motor %zu (%s): rx %zu bytes\n",
@@ -292,6 +314,16 @@ void RtControlLoop::configure_motors() {
             }
             if (is_param_response(pkt.data())) {
                 std::fprintf(stderr, "  [init] skip param response can_id=0x%03X\n", can_id);
+                // Track which motor is stuck
+                for (size_t i = 0; i < 6; ++i) {
+                    if (got_initial[i]) continue;
+                    const auto& m = cfg_.motors[i];
+                    if (can_id == m.slave_id || can_id == m.master_id ||
+                        (can_id == 0 && decode_response_id(pkt.data()) == (m.master_id & 0x0F))) {
+                        ++param_resp_count[i];
+                        break;
+                    }
+                }
                 continue;
             }
 
@@ -373,13 +405,14 @@ void RtControlLoop::calibrate_gripper() {
     std::vector<std::array<uint8_t, RX_PACKET_LEN>> packets;
     int cal_iterations = 0;
     constexpr int MAX_CAL_ITERATIONS = 2000;  // ~10s at 5ms per iteration
-    constexpr float TORQUE_THRESHOLD = 1.2f;  // matches Python DM_CAN calibration
+    constexpr float TORQUE_THRESHOLD = 0.7f;  // match Python threshold
+    constexpr float CAL_VELOCITY = 5.0f;      // gentle homing speed
 
     const uint64_t cal_deadline_ns = now_ns() +
         static_cast<uint64_t>(cfg_.gripper_cal_timeout_s * 1e9);
 
-    // Send VEL command ONCE to start the gripper moving
-    build_vel_frame(frame, gm.slave_id, 10.0f);
+    // Send VEL command ONCE to start the gripper moving (open direction)
+    build_vel_frame(frame, gm.slave_id, CAL_VELOCITY);
     send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 5000);
 
     // Poll with refresh frames to read torque (like Python version)
@@ -407,10 +440,16 @@ void RtControlLoop::calibrate_gripper() {
                         send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
                         build_set_zero_frame(frame, gm.slave_id);
                         send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 200000);
-                        sleep_ms(200);  // match Python's time.sleep(0.2)
+                        sleep_ms(200);
+
+                        // Back off slightly from the hard stop so the open
+                        // position is force-free.  cfg_.gripper_open_pos is
+                        // a small offset (default 0.0) in the close direction
+                        // (negative = towards closed).
+                        gripper_open_pos_ = cfg_.gripper_open_pos;
+
                         build_enable_frame(frame, gm.slave_id);
                         send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
-                        gripper_open_pos_ = static_cast<double>(st.q);
                         goto calibration_done;
                     }
                 }
@@ -444,6 +483,7 @@ calibration_done:
     build_switch_mode_frame(frame, gm.slave_id, 4);  // Torque_Pos
     send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 100000);
 
+    // Read back actual position after set_zero + enable (like Python version)
     build_refresh_frame(frame, gm.slave_id);
     size_t n = send_and_recv(serial_, frame, 30, rx_buf, sizeof(rx_buf), 10000);
     if (n > 0) {
@@ -456,6 +496,12 @@ calibration_done:
                 state_buf_.pos[6] = st.q;
                 state_buf_.vel[6] = st.dq;
                 state_buf_.torque[6] = st.tau;
+                // Use actual encoder reading + configured offset as open pos.
+                // After set_zero, st.q is near 0.  The offset backs off from
+                // the hard stop so the open position is force-free.
+                gripper_open_pos_ = static_cast<double>(st.q) + cfg_.gripper_open_pos;
+                std::fprintf(stderr, "  gripper read-back: pos=%.4f, open_pos=%.4f (offset=%.3f)\n",
+                             st.q, gripper_open_pos_, cfg_.gripper_open_pos);
                 break;
             }
         }
