@@ -54,6 +54,9 @@ struct RtLoopConfig {
     int min_motors_required = 6;          // throw if fewer arm motors respond
 
     // Gripper
+    // gripper_open_pos: offset from the calibrated zero (hard stop) in the
+    // close direction.  A small negative value backs off from the hard stop
+    // so the gripper rests force-free when commanded fully open.
     double gripper_open_pos = 0.0;
     double gripper_closed_pos = -4.7;
     double max_gripper_torque_nm = 1.0;

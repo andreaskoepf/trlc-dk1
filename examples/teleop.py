@@ -63,7 +63,7 @@ def main():
                 last_print_time = now
                 state = follower._robot.get_joint_state()
                 grip = follower._robot.get_gripper_state()
-                perf = follower._robot.get_perf()
+                perf = follower._robot.get_perf() if hasattr(follower._robot, 'get_perf') else None
 
                 tau = state["torque"]
                 tau_str = " ".join(f"{t:+6.2f}" for t in tau)
