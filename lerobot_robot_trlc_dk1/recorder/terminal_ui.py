@@ -117,9 +117,33 @@ class TerminalUI:
             except (OSError, ValueError):
                 pass
 
+    # ANSI color codes
+    _RESET = "\033[0m"
+    _BOLD = "\033[1m"
+    _RED = "\033[91m"
+    _GREEN = "\033[92m"
+    _YELLOW = "\033[93m"
+    _DIM = "\033[2m"
+
+    _STATE_COLORS = {
+        "idle": _DIM,
+        "starting": _YELLOW + _BOLD,
+        "recording": _GREEN + _BOLD,
+        "saving": _YELLOW,
+        "waiting": _YELLOW,
+    }
+
+    _STATE_INDICATORS = {
+        "idle": "  ",       # dim dot
+        "starting": "* ",   # blinking-ish
+        "recording": "● ",  # solid green dot
+        "saving": "~ ",
+        "waiting": "○ ",    # hollow dot
+    }
+
     def _render_status(self):
-        """Render pinned status line at cursor position."""
-        drop_str = f" drops:{self.encoder_drops}" if self.encoder_drops > 0 else ""
+        """Render colored pinned status line."""
+        drop_str = f" {self._RED}drops:{self.encoder_drops}{self._RESET}" if self.encoder_drops > 0 else ""
 
         if self.fps_actual > 0 and self.state == "recording":
             elapsed_s = self.frame_count / max(self.fps_actual, 1)
@@ -127,8 +151,12 @@ class TerminalUI:
         else:
             time_str = "--:--"
 
+        color = self._STATE_COLORS.get(self.state, "")
+        indicator = self._STATE_INDICATORS.get(self.state, "  ")
+
         line = (
-            f"  Ep {self.episode} | {self.state:9s} | "
+            f"  {color}{indicator}{self.state:9s}{self._RESET} | "
+            f"Ep {self.episode} | "
             f"rec:{self.fps_actual:4.0f}Hz teleop:{self.teleop_hz:4.0f}Hz | "
             f"{time_str}{drop_str}"
         )
@@ -153,7 +181,7 @@ class TerminalUI:
 
         if ch == " ":
             self.key_queue.put("space")
-        elif ch.lower() == "r":
+        elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
             self.key_queue.put("rerecord")
         elif ch.lower() == "q" or ch == "\x1b":
             self.key_queue.put("quit")
