@@ -108,18 +108,29 @@ class RecorderThread:
         encoders: dict[str, NvencEncoder],
         camera_keys: list[str],
         fps: int = 30,
+        rerun_enabled: bool = False,
     ):
         self.follower = follower
         self.teleop = teleop
         self.encoders = encoders
         self.camera_keys = camera_keys
         self.fps = fps
+        self.rerun_enabled = rerun_enabled
 
         # Recording state (controlled from main thread)
         self.recording = threading.Event()
         self.episode_index: int = 0
         self.frame_index: int = 0
         self.episode_buffer: list[dict] = []
+
+        # Rest pose auto-end detection (signaled to main thread)
+        self.rest_pose_triggered = threading.Event()
+        self._rest_pose_detector = None
+        try:
+            from lerobot_robot_trlc_dk1.recorder.rest_pose_detector import RestPoseDetector
+            self._rest_pose_detector = RestPoseDetector(fps=fps)
+        except ImportError:
+            pass
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -157,6 +168,11 @@ class RecorderThread:
         self.frame_index = 0
         self.episode_buffer = []
         self._drop_count = 0
+        self.rest_pose_triggered.clear()
+
+        # Reset rest pose detector (will capture pose on first frame)
+        if self._rest_pose_detector is not None:
+            self._rest_pose_detector.reset()
 
         # Tell each encoder to open a new MP4
         for enc in self.encoders.values():
@@ -310,6 +326,28 @@ class RecorderThread:
         })
         self.frame_index += 1
 
+        # 6. Rest pose auto-end detection
+        if self._rest_pose_detector is not None:
+            if self.frame_index == 1:
+                # Capture rest pose from first frame
+                self._rest_pose_detector.capture_rest_pose(obs_state)
+                logger.info(
+                    "Rest pose detector armed (departure_threshold=%.2f rad). "
+                    "Joint pos sample: [%.2f, %.2f, %.2f, ...]",
+                    self._rest_pose_detector.departure_threshold_rad,
+                    obs_state[0], obs_state[3], obs_state[6],
+                )
+            else:
+                if self._rest_pose_detector.update(obs_state, self.frame_index):
+                    # Signal main thread that rest pose was detected
+                    self.rest_pose_triggered.set()
+        elif self.frame_index == 1:
+            logger.warning("Rest pose detector not available")
+
+        # 7. Log to Rerun (if enabled)
+        if self.rerun_enabled:
+            self._log_rerun(obs, obs_state, action_vec)
+
         # Log timing for first few frames and periodically
         if self.frame_index <= 5 or self.frame_index % 100 == 0:
             total_ms = (time.perf_counter() - t_start) * 1000
@@ -321,3 +359,41 @@ class RecorderThread:
                 (t_dispatch - t_cams) * 1000,
                 total_ms,
             )
+
+    def _log_rerun(self, obs: dict, obs_state: np.ndarray, action_vec: np.ndarray):
+        """Log current frame to Rerun viewer."""
+        try:
+            import rerun as rr
+
+            # Set timeline so scalars appear as time series
+            rr.set_time("frame", sequence=self.frame_index)
+
+            # Camera images — static=True so only latest frame is kept in memory.
+            # Without this, Rerun accumulates ~237 MB/s of image data.
+            for cam_key in self.camera_keys:
+                image = obs.get(cam_key)
+                if image is not None:
+                    rr.log(f"cameras/{cam_key}", rr.Image(image), static=True)
+
+            # Joint positions
+            for i, name in enumerate(OBS_STATE_KEYS):
+                if ".pos" in name:
+                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
+
+            # Joint velocities
+            for i, name in enumerate(OBS_STATE_KEYS):
+                if ".vel" in name:
+                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
+
+            # Joint torques
+            for i, name in enumerate(OBS_STATE_KEYS):
+                if ".torque" in name:
+                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
+
+            # Actions
+            for i, name in enumerate(ACTION_KEYS):
+                rr.log(f"action/{name}", rr.Scalars([action_vec[i]]))
+
+        except Exception:
+            if self.frame_index <= 2:
+                logger.exception("Rerun logging error (frame %d)", self.frame_index)

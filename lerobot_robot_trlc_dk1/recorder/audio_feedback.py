@@ -17,6 +17,10 @@
 Beep WAV files are generated once at init time and played via ``aplay``
 (non-blocking subprocess). TTS uses ``spd-say`` (espeak) by default,
 with optional ``piper-tts`` for higher quality.
+
+To keep HDMI audio active (avoiding spin-up delay on monitors like ASUS),
+run the separate ``audio_keepalive.py`` script in another terminal before
+starting the recorder.
 """
 
 from __future__ import annotations
@@ -83,6 +87,10 @@ class AudioFeedback:
             except OSError:
                 logger.warning("Failed to create beep file: %s", path)
 
+    def stop(self):
+        """Cleanup (no-op now, kept for API compatibility)."""
+        pass
+
     def _play_beep(self, name: str):
         """Play a pre-generated beep (non-blocking)."""
         if not self.enabled or not self._has_aplay:
@@ -129,6 +137,7 @@ class AudioFeedback:
 
     def episode_end(self, episode_num: int):
         self._play_beep("episode_end")
+        self._speak(f"Episode {episode_num} saved")
 
     def gesture_detected(self):
         self._play_beep("gesture")
@@ -136,6 +145,10 @@ class AudioFeedback:
     def error(self, message: str):
         self._play_beep("error")
         self._speak(message)
+
+    def episode_discarded(self, episode_num: int):
+        self._play_beep("error")
+        self._speak(f"Episode {episode_num} discarded")
 
     def recording_done(self):
         self._play_beep("done")

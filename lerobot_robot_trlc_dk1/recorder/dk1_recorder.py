@@ -388,16 +388,7 @@ def main():
         target_hz=args.teleop_hz,
     )
 
-    # Recorder thread
-    recorder = RecorderThread(
-        follower=follower,
-        teleop=teleop,
-        encoders=encoders,
-        camera_keys=CAMERA_KEYS,
-        fps=args.fps,
-    )
-
-    # Rerun (opt-in)
+    # Rerun (opt-in) — init before recorder so it can log frames
     rerun_enabled = args.visualize
     if rerun_enabled:
         try:
@@ -409,6 +400,16 @@ def main():
         except ImportError:
             logger.warning("rerun-sdk not installed, disabling visualization")
             rerun_enabled = False
+
+    # Recorder thread
+    recorder = RecorderThread(
+        follower=follower,
+        teleop=teleop,
+        encoders=encoders,
+        camera_keys=CAMERA_KEYS,
+        fps=args.fps,
+        rerun_enabled=rerun_enabled,
+    )
 
     # -- SIGUSR1 thread dump (kill -USR1 <pid> to diagnose hangs) ----------
 
@@ -479,8 +480,31 @@ def main():
     except ImportError:
         audio = None
 
-    print("\n  DK1 Recorder ready.")
-    print("  Controls: [Space] start/stop recording  [R] re-record  [Esc/Q] quit\n")
+    _B = "\033[1m"  # bold
+    _N = "\033[0m"  # reset
+    _C = "\033[96m" # cyan
+    print(f"""
+  {_B}DK1 Recorder{_N} — ready
+  Dataset: {args.dataset_dir}
+  Task:    {args.task}
+  Codec:   {next(iter(actual_codecs.values()))}
+  Video:   {args.camera_width}x{args.camera_height} @ {args.camera_fps}fps capture, {args.fps}fps recording
+  Teleop:  {args.teleop_hz:.0f} Hz
+
+  {_B}Keyboard controls:{_N}
+    {_C}Space{_N}   Start recording / end episode (immediate)
+    {_C}R / Bksp{_N} Discard current episode and re-record
+    {_C}Q / Esc{_N} Stop recording and save dataset
+
+  {_B}Gripper gesture:{_N}
+    Double-close either gripper (close → open → close within 0.8s)
+    Start: waits for grippers to fully open before recording
+    Stop:  trims gesture frames from episode tail (~1.3s)
+
+  {_B}Auto-end:{_N}
+    Episode ends automatically when both arms return to their
+    starting position with grippers open and joints settled (~1s).
+""")
 
     try:
         _run_event_loop(
@@ -524,6 +548,12 @@ def main():
         if ui is not None:
             try:
                 ui.stop()
+            except Exception:
+                pass
+
+        if audio is not None:
+            try:
+                audio.stop()
             except Exception:
                 pass
 
@@ -663,9 +693,13 @@ def _run_event_loop(
 
         elif state == RecorderState.RECORDING:
             too_short = recorder.frame_index < MIN_FRAMES_PER_EPISODE
-            if key_event == "space" or (gesture_triggered and not too_short):
+
+            # Check rest pose auto-end (signaled from recorder thread)
+            rest_pose_end = recorder.rest_pose_triggered.is_set()
+
+            if key_event == "space" or (gesture_triggered and not too_short) or rest_pose_end:
                 # End current episode
-                if too_short:
+                if too_short and not key_event == "space":
                     logger.warning(
                         "Episode too short (%d frames < %d), ignoring",
                         recorder.frame_index, MIN_FRAMES_PER_EPISODE,
@@ -673,7 +707,21 @@ def _run_event_loop(
                 else:
                     # Determine trim: gesture-triggered stops trim trailing
                     # frames to remove the double-close motion from data.
-                    trim = STOP_TRIM_FRAMES if gesture_triggered else 0
+                    # Rest pose detection already waited for settle, so trim
+                    # just the settle window (those frames are at rest, not task).
+                    if gesture_triggered:
+                        trim = STOP_TRIM_FRAMES
+                    elif rest_pose_end:
+                        # Trim the settle period (robot was stationary at rest)
+                        trim = 30  # ~1s settle window
+                        if audio is not None:
+                            audio.gesture_detected()  # audible confirmation
+                        logger.info(
+                            "Auto-end: rest pose detected at frame %d",
+                            recorder.frame_index,
+                        )
+                    else:
+                        trim = 0
                     state = RecorderState.SAVING
                     _save_episode(
                         recorder, encoders, writer, episode_index, audio,
@@ -695,6 +743,8 @@ def _run_event_loop(
                     except queue.Empty:
                         pass
                 # TODO: delete the partially-written MP4 files
+                if audio is not None:
+                    audio.episode_discarded(episode_index)
                 state = RecorderState.WAITING
                 last_transition_time = time.monotonic()
                 _print_state(state, episode_index)
@@ -825,16 +875,22 @@ def _save_episode(
         audio.episode_end(episode_index)
 
 
+_G = "\033[92m\033[1m"  # green bold
+_Y = "\033[93m\033[1m"  # yellow bold
+_D = "\033[2m"          # dim
+_R = "\033[0m"          # reset
+
+
 def _print_state(state: str, episode_index: int):
-    """Simple console status (used when terminal_ui is not available)."""
+    """Simple colored console status (used when terminal_ui is not available)."""
     if state == RecorderState.RECORDING:
-        print(f"\r  >> RECORDING episode {episode_index} (Space=stop, R=re-record, Q=quit)", end="", flush=True)
+        print(f"\r  {_G}● RECORDING{_R} episode {episode_index} (Space=stop, R=re-record, Q=quit)", end="", flush=True)
     elif state == RecorderState.STARTING:
-        print(f"\r  .. OPEN GRIPPERS to start episode {episode_index} (Space=force start) ", end="", flush=True)
+        print(f"\r  {_Y}* OPEN GRIPPERS{_R} to start episode {episode_index} (Space=force start) ", end="", flush=True)
     elif state == RecorderState.WAITING:
-        print(f"\r  -- WAITING for reset (Space=start episode {episode_index}, Q=quit)   ", end="", flush=True)
+        print(f"\r  {_Y}○ WAITING{_R} for reset (Space=start episode {episode_index}, Q=quit)   ", end="", flush=True)
     elif state == RecorderState.IDLE:
-        print(f"\r  -- IDLE (Space=start recording)                                       ", end="", flush=True)
+        print(f"\r  {_D}  IDLE{_R} (Space=start recording)                                       ", end="", flush=True)
 
 
 def _poll_stdin_nonblocking() -> str | None:
@@ -852,7 +908,7 @@ def _poll_stdin_nonblocking() -> str | None:
         return None
     if ch == " ":
         return "space"
-    elif ch.lower() == "r":
+    elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
         return "rerecord"
     elif ch.lower() == "q" or ch == "\x1b":
         return "quit"
