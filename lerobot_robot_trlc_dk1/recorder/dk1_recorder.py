@@ -786,13 +786,15 @@ def _run_event_loop(
                 # Discard current episode
                 logger.info("Discarding episode %d", episode_index)
                 recorder.end_episode()  # drain buffer, signal encoders
-                # Wait for encoder results (discard them)
+                # Wait for encoder results and delete orphan MP4 files
                 for enc in encoders.values():
                     try:
-                        enc.result_queue.get(timeout=5.0)
+                        result = enc.result_queue.get(timeout=5.0)
+                        if result.mp4_path and result.mp4_path.exists():
+                            result.mp4_path.unlink()
+                            logger.debug("Deleted orphan %s", result.mp4_path)
                     except queue.Empty:
                         pass
-                # TODO: delete the partially-written MP4 files
                 if audio is not None:
                     audio.episode_discarded(episode_index)
                 state = RecorderState.WAITING

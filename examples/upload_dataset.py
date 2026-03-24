@@ -87,9 +87,6 @@ task_categories:
 - robotics
 tags:
 - LeRobot
-- bimanual
-- teleoperation
-- DK1
 configs:
 - config_name: default
   data_files: data/*/*.parquet
@@ -166,8 +163,8 @@ print(frame["observation.images.head"].shape)  # torch.Size([3, 720, 1280])
 def _build_hf_parquet_metadata(table: pa.Table) -> dict:
     """Build HuggingFace schema metadata for a parquet table.
 
-    hyparquet (the JS parquet reader) uses this to deserialize
-    fixed_size_list columns into JavaScript arrays.
+    The HF datasets library uses this metadata to correctly interpret
+    list columns as fixed-length sequences.
     """
     features = {}
     for field in table.schema:
@@ -191,78 +188,146 @@ def _build_hf_parquet_metadata(table: pa.Table) -> dict:
     return {b"huggingface": json.dumps({"info": {"features": features}}).encode()}
 
 
-def _fix_parquet_schema(path: Path):
-    """Re-encode a data parquet to use fixed_size_list<float> instead of list<double>.
+def _compute_episode_scalar_stats(data_table: pa.Table) -> dict[str, dict]:
+    """Compute per-episode stats for scalar features in a data parquet."""
+    from lerobot.datasets.compute_stats import RunningQuantileStats
+    import numpy as np
 
-    The LeRobot visualizer requires fixed_size_list columns for observation.state
-    and action features.
+    stats = {}
+    for col_name in data_table.column_names:
+        col = data_table.column(col_name)
+        col_type = str(data_table.schema.field(col_name).type)
+
+        if "list" in col_type:
+            # Vector feature (observation.state, action)
+            pydata = col.to_pylist()
+            if not pydata or pydata[0] is None:
+                continue
+            batch = np.array(pydata, dtype=np.float32)
+        elif "int" in col_type or "float" in col_type:
+            # Scalar feature
+            batch = np.array(col.to_pylist(), dtype=np.float64).reshape(-1, 1)
+        else:
+            continue
+
+        if len(batch) < 2:
+            continue
+        rqs = RunningQuantileStats()
+        rqs.update(batch)
+        try:
+            raw = rqs.get_statistics()
+            stats[col_name] = {k: v.tolist() for k, v in raw.items()}
+        except ValueError:
+            pass
+    return stats
+
+
+def _repair_episode_metadata(dataset_dir: Path):
+    """Rebuild episode metadata with full per-episode stats from data parquet files.
+
+    Reads each data parquet, computes stats for ALL features, and rewrites
+    the episode metadata parquet with the complete stats columns.
     """
-    t = pq.read_table(path)
-    needs_fix = False
-    for field in t.schema:
-        if field.name in ("observation.state", "action"):
-            if "fixed_size_list" not in str(field.type):
-                needs_fix = True
-                break
-
-    if not needs_fix:
-        # Still reorder columns and ensure HF metadata exists
-        col_order = ["action", "observation.state", "timestamp",
-                     "frame_index", "episode_index", "index", "task_index"]
-        existing = [c for c in col_order if c in t.column_names]
-        extra = [c for c in t.column_names if c not in col_order]
-        needs_reorder = (existing + extra != t.column_names)
-        has_hf_meta = t.schema.metadata and b"huggingface" in t.schema.metadata
-        if needs_reorder or not has_hf_meta:
-            if needs_reorder:
-                t = t.select(existing + extra)
-            if not has_hf_meta:
-                t = t.replace_schema_metadata({
-                    **_build_hf_parquet_metadata(t),
-                    **(t.schema.metadata or {}),
-                })
-            pq.write_table(t, path, compression="snappy")
+    meta_path = dataset_dir / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    if not meta_path.exists():
         return
 
-    cols = {}
-    # Process in reference column order
-    col_order = ["action", "observation.state", "timestamp",
-                 "frame_index", "episode_index", "index", "task_index"]
-    all_cols = [c for c in col_order if c in t.column_names]
-    all_cols += [c for c in t.column_names if c not in col_order]
+    meta = pq.read_table(meta_path)
+    rows = meta.to_pydict()
+    n = len(rows["episode_index"])
 
-    for name in all_cols:
-        col = t.column(name)
-        if name in ("observation.state", "action"):
-            pydata = col.to_pylist()
-            dim = len(pydata[0])
-            flat = [float(v) for row in pydata for v in row]
-            cols[name] = pa.FixedSizeListArray.from_arrays(
-                pa.array(flat, type=pa.float32()), list_size=dim
-            )
-        elif "float" in str(t.schema.field(name).type) or "double" in str(t.schema.field(name).type):
-            cols[name] = pa.array(col.to_pylist(), type=pa.float32())
-        else:
-            cols[name] = col
+    info = json.loads((dataset_dir / "meta" / "info.json").read_text())
+    chunks_size = info.get("chunks_size", 1000)
 
-    new_table = pa.table(cols)
-    new_table = new_table.replace_schema_metadata({
-        **_build_hf_parquet_metadata(new_table),
-        **(new_table.schema.metadata or {}),
-    })
-    pq.write_table(new_table, path, compression="snappy")
+    print(f"  Repairing episode metadata stats for {n} episodes...")
+
+    for i in range(n):
+        ep_idx = rows["episode_index"][i]
+        chunk = ep_idx // chunks_size
+        file_idx = ep_idx % chunks_size
+        data_path = dataset_dir / "data" / f"chunk-{chunk:03d}" / f"file-{file_idx:03d}.parquet"
+
+        if not data_path.exists():
+            continue
+
+        data_table = pq.read_table(data_path)
+        ep_stats = _compute_episode_scalar_stats(data_table)
+
+        for feat_key, feat_stats in ep_stats.items():
+            for stat_key, stat_val in feat_stats.items():
+                col_name = f"stats/{feat_key}/{stat_key}"
+                if col_name not in rows:
+                    rows[col_name] = [None] * n
+                rows[col_name][i] = stat_val
+
+    pq.write_table(pa.Table.from_pydict(rows), meta_path, compression="snappy")
+
+    # Count stats columns
+    stats_cols = [c for c in rows if c.startswith("stats/")]
+    print(f"  Episode metadata now has {len(stats_cols)} stats columns")
+
+
+def _reorder_info_features(dataset_dir: Path):
+    """Reorder info.json features: action, observation.state first, then videos, then metadata.
+
+    The HF dataset visualizer iterates features in order and expects
+    action/observation.state before video features.
+    """
+    info_path = dataset_dir / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    features = info.get("features", {})
+
+    def _reorder_keys(feat: dict) -> dict:
+        """Reorder keys within a feature dict to match reference: dtype, names, shape, ..."""
+        out = {}
+        for k in ["dtype", "names", "shape", "info"]:
+            if k in feat:
+                out[k] = feat[k]
+        for k in feat:
+            if k not in out:
+                out[k] = feat[k]
+        return out
+
+    # Desired order: action, observation.state, video features, scalar metadata
+    ordered = {}
+    for key in ["action", "observation.state"]:
+        if key in features:
+            ordered[key] = _reorder_keys(features[key])
+    for key in features:
+        if key.startswith("observation.images."):
+            ordered[key] = _reorder_keys(features[key])
+    for key in ["timestamp", "frame_index", "episode_index", "index", "task_index"]:
+        if key in features:
+            ordered[key] = _reorder_keys(features[key])
+    for key in features:
+        if key not in ordered:
+            ordered[key] = _reorder_keys(features[key])
+
+    # Ensure scalar features have "names": null (required by LeRobot reference format)
+    for key in ("timestamp", "frame_index", "episode_index", "index", "task_index"):
+        if key in ordered and "names" not in ordered[key]:
+            ordered[key]["names"] = None
+
+    if ordered != features:
+        info["features"] = ordered
+        info_path.write_text(json.dumps(info, indent=2))
+        print("  Fixed info.json features (order / missing names)")
+        return True
+    return False
 
 
 def cleanup_dataset(dataset_dir: Path):
-    """Remove orphan files and re-index episodes to be contiguous from 0.
+    """Remove orphan files, re-index episodes contiguously, fix global index.
 
     The dk1-recorder can leave orphan data/video files from discarded episodes
     that aren't in the episode metadata. This also re-indexes non-contiguous
-    episode indices (e.g. 2,3,4... → 0,1,2...) which is required by the
-    LeRobot visualizer.
+    episode indices (e.g. 2,3,4... → 0,1,2...) and ensures the global `index`
+    column starts at 0 and is contiguous across episodes.
     """
     meta_path = dataset_dir / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
     info_path = dataset_dir / "meta" / "info.json"
+
+    info_changed = _reorder_info_features(dataset_dir)
 
     if not meta_path.exists():
         print("  No episode metadata found, skipping cleanup")
@@ -270,100 +335,182 @@ def cleanup_dataset(dataset_dir: Path):
 
     meta = pq.read_table(meta_path)
     old_indices = meta.column("episode_index").to_pylist()
-
-    if old_indices == list(range(len(old_indices))):
-        print(f"  Episodes already contiguous (0..{len(old_indices)-1})")
-        _remove_orphan_files(dataset_dir, set(old_indices))
-        # Still fix parquet schemas
-        print("  Fixing parquet schemas...")
-        for parquet_file in sorted((dataset_dir / "data").rglob("*.parquet")):
-            _fix_parquet_schema(parquet_file)
-        return
-
-    print(f"  Re-indexing {len(old_indices)} episodes: {old_indices[0]}..{old_indices[-1]} → 0..{len(old_indices)-1}")
-
     info = json.loads(info_path.read_text())
     chunks_size = info.get("chunks_size", 1000)
+    n = len(old_indices)
 
-    # Build old→new index mapping
+    # Build old→new episode index mapping
+    need_reindex = old_indices != list(range(n))
     index_map = {old: new for new, old in enumerate(sorted(old_indices))}
 
-    # 1. Rename data parquet files and update episode_index inside
-    for old_idx, new_idx in index_map.items():
-        old_chunk, old_file = old_idx // chunks_size, old_idx % chunks_size
-        new_chunk, new_file = new_idx // chunks_size, new_idx % chunks_size
+    if need_reindex:
+        print(f"  Re-indexing {n} episodes: {old_indices[0]}..{old_indices[-1]} → 0..{n-1}")
 
-        old_path = dataset_dir / "data" / f"chunk-{old_chunk:03d}" / f"file-{old_file:03d}.parquet"
-        new_path = dataset_dir / "data" / f"chunk-{new_chunk:03d}" / f"file-{new_file:03d}.parquet"
-
-        if old_path.exists() and old_idx != new_idx:
-            # Read, update episode_index, write to new path
-            t = pq.read_table(old_path)
-            cols = t.to_pydict()
-            cols["episode_index"] = [new_idx] * len(cols["episode_index"])
-            new_table = pa.Table.from_pydict(cols)
-            new_path.parent.mkdir(parents=True, exist_ok=True)
-            pq.write_table(new_table, new_path, compression="snappy")
-            if old_path != new_path:
-                old_path.unlink()
-
-    # 2. Rename video files
-    for cam_dir in (dataset_dir / "videos").iterdir():
-        if not cam_dir.is_dir():
-            continue
+        # Rename data parquet files and update episode_index inside
         for old_idx, new_idx in index_map.items():
             if old_idx == new_idx:
                 continue
             old_chunk, old_file = old_idx // chunks_size, old_idx % chunks_size
             new_chunk, new_file = new_idx // chunks_size, new_idx % chunks_size
-            old_path = cam_dir / f"chunk-{old_chunk:03d}" / f"file-{old_file:03d}.mp4"
-            new_path = cam_dir / f"chunk-{new_chunk:03d}" / f"file-{new_file:03d}.mp4"
+            old_path = dataset_dir / "data" / f"chunk-{old_chunk:03d}" / f"file-{old_file:03d}.parquet"
+            new_path = dataset_dir / "data" / f"chunk-{new_chunk:03d}" / f"file-{new_file:03d}.parquet"
             if old_path.exists():
+                t = pq.read_table(old_path)
+                cols = t.to_pydict()
+                cols["episode_index"] = [new_idx] * len(cols["episode_index"])
                 new_path.parent.mkdir(parents=True, exist_ok=True)
-                old_path.rename(new_path)
+                pq.write_table(pa.Table.from_pydict(cols), new_path, compression="snappy")
+                if old_path != new_path:
+                    old_path.unlink()
 
-    # 3. Rewrite episode metadata with new indices
-    rows = meta.to_pydict()
-    n = len(old_indices)
-    rows["episode_index"] = list(range(n))
-    for i, old_idx in enumerate(old_indices):
-        new_idx = index_map[old_idx]
-        new_chunk, new_file = new_idx // chunks_size, new_idx % chunks_size
-        rows["data/chunk_index"][i] = new_chunk
-        rows["data/file_index"][i] = new_file
-        # Update video indices
-        for col in rows:
-            if col.startswith("videos/") and col.endswith("/chunk_index"):
-                rows[col][i] = new_chunk
-            elif col.startswith("videos/") and col.endswith("/file_index"):
-                rows[col][i] = new_file
+        # Rename video files
+        if (dataset_dir / "videos").exists():
+            for cam_dir in (dataset_dir / "videos").iterdir():
+                if not cam_dir.is_dir():
+                    continue
+                for old_idx, new_idx in index_map.items():
+                    if old_idx == new_idx:
+                        continue
+                    old_chunk, old_file = old_idx // chunks_size, old_idx % chunks_size
+                    new_chunk, new_file = new_idx // chunks_size, new_idx % chunks_size
+                    old_path = cam_dir / f"chunk-{old_chunk:03d}" / f"file-{old_file:03d}.mp4"
+                    new_path = cam_dir / f"chunk-{new_chunk:03d}" / f"file-{new_file:03d}.mp4"
+                    if old_path.exists():
+                        new_path.parent.mkdir(parents=True, exist_ok=True)
+                        old_path.rename(new_path)
 
-    # Recompute dataset_from_index / dataset_to_index
-    running_idx = 0
+    # Remove orphan files
+    _remove_orphan_files(dataset_dir, set(range(n)), chunks_size)
+
+    # Check parquet schemas and global index column
+    meta_dict = meta.to_pydict()
+    if need_reindex:
+        meta_dict["episode_index"] = list(range(n))
+    global_idx = 0
+    parquets_fixed = 0
+    meta_changed = need_reindex
     for i in range(n):
-        length = rows["length"][i]
-        rows["dataset_from_index"][i] = running_idx
-        rows["dataset_to_index"][i] = running_idx + length
-        running_idx += length
+        ep_idx = i if need_reindex else meta_dict["episode_index"][i]
+        chunk = ep_idx // chunks_size
+        file_idx = ep_idx % chunks_size
+        data_path = dataset_dir / "data" / f"chunk-{chunk:03d}" / f"file-{file_idx:03d}.parquet"
+        if not data_path.exists():
+            print(f"  WARNING: missing {data_path}")
+            continue
 
-    pq.write_table(pa.Table.from_pydict(rows), meta_path, compression="snappy")
+        t = pq.read_table(data_path)
+        n_rows = t.num_rows
+        needs_write = False
 
-    # 4. Update info.json
-    info["total_episodes"] = n
-    info["total_frames"] = running_idx
-    info["splits"] = {"train": f"0:{n}"}
-    info_path.write_text(json.dumps(info, indent=2))
+        # Fix global index column
+        old_start = t.column("index")[0].as_py() if n_rows > 0 else global_idx
+        if old_start != global_idx:
+            needs_write = True
 
-    # 5. Remove orphan files
-    valid_indices = set(range(n))
-    _remove_orphan_files(dataset_dir, valid_indices)
+        # Fix parquet schema (ensure list<float>, HF metadata, column order)
+        needs_schema_fix = _needs_parquet_fix(t)
+        if needs_schema_fix:
+            needs_write = True
 
-    # 6. Fix parquet schema (list<double> → fixed_size_list<float>)
-    print("  Fixing parquet schemas...")
-    for parquet_file in sorted((dataset_dir / "data").rglob("*.parquet")):
-        _fix_parquet_schema(parquet_file)
+        if needs_write:
+            cols = {}
+            col_order = ["action", "observation.state", "timestamp",
+                         "frame_index", "episode_index", "index", "task_index"]
+            all_cols = [c for c in col_order if c in t.column_names]
+            all_cols += [c for c in t.column_names if c not in col_order]
 
-    print(f"  Done: {n} episodes, {running_idx} frames")
+            for name in all_cols:
+                col = t.column(name)
+                if name == "index":
+                    cols[name] = pa.array(list(range(global_idx, global_idx + n_rows)), type=pa.int64())
+                elif name in ("observation.state", "action") and needs_schema_fix:
+                    cols[name] = pa.array(col.to_pylist(), type=pa.list_(pa.float32()))
+                elif ("float" in str(t.schema.field(name).type) or "double" in str(t.schema.field(name).type)) and "list" not in str(t.schema.field(name).type):
+                    cols[name] = pa.array(col.to_pylist(), type=pa.float32())
+                else:
+                    cols[name] = col
+
+            new_table = pa.table(cols)
+            new_table = new_table.replace_schema_metadata({
+                **_build_hf_parquet_metadata(new_table),
+                **(new_table.schema.metadata or {}),
+            })
+            pq.write_table(new_table, data_path, compression="snappy")
+            parquets_fixed += 1
+
+        # Update episode metadata indices if changed
+        if need_reindex:
+            new_chunk, new_file = i // chunks_size, i % chunks_size
+            meta_dict["data/chunk_index"][i] = new_chunk
+            meta_dict["data/file_index"][i] = new_file
+            for col in meta_dict:
+                if col.startswith("videos/") and col.endswith("/chunk_index"):
+                    meta_dict[col][i] = new_chunk
+                elif col.startswith("videos/") and col.endswith("/file_index"):
+                    meta_dict[col][i] = new_file
+
+        old_from = meta_dict["dataset_from_index"][i]
+        old_to = meta_dict["dataset_to_index"][i]
+        if old_from != global_idx or old_to != global_idx + n_rows:
+            meta_changed = True
+        meta_dict["dataset_from_index"][i] = global_idx
+        meta_dict["dataset_to_index"][i] = global_idx + n_rows
+        global_idx += n_rows
+
+    if parquets_fixed:
+        print(f"  Fixed {parquets_fixed} parquet files (schema/index)")
+
+    # Check if episode stats need repair
+    stats_cols = [c for c in meta_dict if c.startswith("stats/")]
+    needs_stats_repair = len(stats_cols) == 0
+
+    if meta_changed:
+        pq.write_table(pa.Table.from_pydict(meta_dict), meta_path, compression="snappy")
+
+    if needs_stats_repair:
+        _repair_episode_metadata(dataset_dir)
+
+    # Check if info.json needs updating
+    info_needs_update = False
+    data_dir = dataset_dir / "data"
+    video_dir = dataset_dir / "videos"
+    new_data_mb = round(sum(f.stat().st_size for f in data_dir.rglob("*.parquet")) / (1024 * 1024))
+    new_video_mb = round(sum(f.stat().st_size for f in video_dir.rglob("*.mp4")) / (1024 * 1024)) if video_dir.exists() else 0
+
+    if (info["total_episodes"] != n or info["total_frames"] != global_idx
+            or info.get("data_files_size_in_mb") != new_data_mb
+            or info.get("video_files_size_in_mb") != new_video_mb):
+        info["total_episodes"] = n
+        info["total_frames"] = global_idx
+        info["splits"] = {"train": f"0:{n}"}
+        info["data_files_size_in_mb"] = new_data_mb
+        info["video_files_size_in_mb"] = new_video_mb
+        info_path.write_text(json.dumps(info, indent=2))
+        info_needs_update = True
+
+    if not (info_changed or need_reindex or parquets_fixed or meta_changed
+            or needs_stats_repair or info_needs_update):
+        print(f"  Dataset OK: {n} episodes, {global_idx} frames (nothing to fix)")
+    else:
+        print(f"  Done: {n} episodes, {global_idx} frames")
+
+
+def _needs_parquet_fix(table: pa.Table) -> bool:
+    """Check if a parquet table needs schema fixes."""
+    for field in table.schema:
+        if field.name in ("observation.state", "action"):
+            ftype = str(field.type)
+            if "fixed_size_list" in ftype or "double" in ftype:
+                return True
+    if not (table.schema.metadata and b"huggingface" in table.schema.metadata):
+        return True
+    # Check column order
+    col_order = ["action", "observation.state", "timestamp",
+                 "frame_index", "episode_index", "index", "task_index"]
+    existing = [c for c in col_order if c in table.column_names]
+    if existing != table.column_names[:len(existing)]:
+        return True
+    return False
 
 
 def _remove_orphan_files(dataset_dir: Path, valid_indices: set[int], chunks_size: int = 1000):
@@ -403,6 +550,7 @@ def main():
     p.add_argument("--license", type=str, default="apache-2.0", help="License identifier")
     p.add_argument("--private", action="store_true", help="Create private dataset")
     p.add_argument("--readme-only", action="store_true", help="Only generate README, don't upload")
+    p.add_argument("--num-workers", type=int, default=2, help="Concurrent upload workers (default: 2)")
     args = p.parse_args()
 
     dataset_dir = args.dataset_dir
@@ -470,13 +618,14 @@ def main():
         exist_ok=True,
     )
 
-    # Upload all files
-    print("Uploading files (this may take a while for large datasets)...")
-    api.upload_folder(
+    # Upload all files (upload_large_folder handles batching and retries)
+    print("Uploading files...")
+    api.upload_large_folder(
         folder_path=str(dataset_dir),
         repo_id=args.repo_id,
         repo_type="dataset",
-        ignore_patterns=["images/"],  # skip raw images if any
+        ignore_patterns=["images/"],
+        num_workers=args.num_workers,
     )
 
     print(f"\nDone! Dataset available at:")
