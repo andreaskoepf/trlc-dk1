@@ -196,12 +196,18 @@ class DatasetWriter:
         from_index = self.global_frame_index
         to_index = from_index + n_frames
 
-        # 1. Write data parquet
+        # 1. Compute per-episode scalar stats (for episode metadata)
+        scalar_stats = self._compute_scalar_episode_stats(
+            scalar_frames, from_index
+        )
+
+        # 2. Write data parquet
         self._write_data_parquet(ep_index, scalar_frames, from_index)
 
-        # 2. Append episode metadata row and rewrite metadata parquet
+        # 3. Append episode metadata row and rewrite metadata parquet
         self._append_episode_metadata(
-            ep_index, n_frames, from_index, to_index, video_results
+            ep_index, n_frames, from_index, to_index, video_results,
+            scalar_stats,
         )
 
         # 3. Update aggregate stats
@@ -245,23 +251,108 @@ class DatasetWriter:
         timestamps = [float(f["timestamp"]) for f in frames]
         task_indices = [f["task_index"] for f in frames]
 
-        # Vector features as lists of lists (Arrow list<float> columns)
+        # Vector features as fixed-size lists of float32
+        # (matching LeRobot's HuggingFace Sequence format: fixed_size_list<float>[N])
+        obs_dim = len(frames[0]["observation.state"])
+        act_dim = len(frames[0]["action"])
         obs_states = [f["observation.state"].tolist() for f in frames]
         actions = [f["action"].tolist() for f in frames]
 
+        # Column order matches LeRobot reference datasets:
+        # action, observation.state first, then metadata columns
         table = pa.table({
-            "index": pa.array(indices, type=pa.int64()),
+            "action": pa.FixedSizeListArray.from_arrays(
+                pa.array([v for row in actions for v in row], type=pa.float32()),
+                list_size=act_dim,
+            ),
+            "observation.state": pa.FixedSizeListArray.from_arrays(
+                pa.array([v for row in obs_states for v in row], type=pa.float32()),
+                list_size=obs_dim,
+            ),
+            "timestamp": pa.array(timestamps, type=pa.float32()),
             "frame_index": pa.array(frame_indices, type=pa.int64()),
             "episode_index": pa.array(episode_indices, type=pa.int64()),
-            "timestamp": pa.array(timestamps, type=pa.float32()),
+            "index": pa.array(indices, type=pa.int64()),
             "task_index": pa.array(task_indices, type=pa.int64()),
-            "observation.state": pa.array(obs_states, type=pa.list_(pa.float32())),
-            "action": pa.array(actions, type=pa.list_(pa.float32())),
+        })
+
+        # Embed HuggingFace feature metadata in parquet schema.
+        # hyparquet (the JS parquet reader used by the HF dataset visualizer)
+        # requires this to correctly deserialize fixed_size_list columns.
+        hf_meta = {
+            "info": {
+                "features": {
+                    "action": {"feature": {"dtype": "float32", "_type": "Value"}, "length": act_dim, "_type": "List"},
+                    "observation.state": {"feature": {"dtype": "float32", "_type": "Value"}, "length": obs_dim, "_type": "List"},
+                    "timestamp": {"dtype": "float32", "_type": "Value"},
+                    "frame_index": {"dtype": "int64", "_type": "Value"},
+                    "episode_index": {"dtype": "int64", "_type": "Value"},
+                    "index": {"dtype": "int64", "_type": "Value"},
+                    "task_index": {"dtype": "int64", "_type": "Value"},
+                }
+            }
+        }
+        table = table.replace_schema_metadata({
+            b"huggingface": json.dumps(hf_meta).encode(),
+            **(table.schema.metadata or {}),
         })
 
         pq.write_table(table, path, compression="snappy")
 
     # -- Episode metadata ---------------------------------------------------
+
+    def _compute_scalar_episode_stats(
+        self, scalar_frames: list[dict], from_index: int,
+    ) -> dict[str, dict[str, list]]:
+        """Compute per-episode stats for all scalar features.
+
+        Returns dict of feature_name → {stat_name: [values]}.
+        """
+        stats_out: dict[str, dict[str, list]] = {}
+        n = len(scalar_frames)
+
+        # observation.state and action
+        for feat_key in ("observation.state", "action"):
+            batch = np.stack([f[feat_key] for f in scalar_frames])
+            rqs = RunningQuantileStats()
+            rqs.update(batch)
+            try:
+                raw = rqs.get_statistics()
+                stats_out[feat_key] = {k: v.tolist() for k, v in raw.items()}
+            except ValueError:
+                pass
+
+        # Scalar metadata features: timestamp, frame_index, episode_index, index, task_index
+        for feat_key in ("timestamp", "frame_index", "episode_index", "task_index"):
+            if feat_key == "timestamp":
+                vals = np.array([float(f[feat_key]) for f in scalar_frames], dtype=np.float32)
+            elif feat_key == "frame_index":
+                vals = np.array([f[feat_key] for f in scalar_frames], dtype=np.float64)
+            elif feat_key == "episode_index":
+                vals = np.array([f[feat_key] for f in scalar_frames], dtype=np.float64)
+            elif feat_key == "task_index":
+                vals = np.array([f[feat_key] for f in scalar_frames], dtype=np.float64)
+            else:
+                continue
+            rqs = RunningQuantileStats()
+            rqs.update(vals.reshape(-1, 1))
+            try:
+                raw = rqs.get_statistics()
+                stats_out[feat_key] = {k: v.tolist() for k, v in raw.items()}
+            except ValueError:
+                pass
+
+        # index (global)
+        indices = np.arange(from_index, from_index + n, dtype=np.float64)
+        rqs = RunningQuantileStats()
+        rqs.update(indices.reshape(-1, 1))
+        try:
+            raw = rqs.get_statistics()
+            stats_out["index"] = {k: v.tolist() for k, v in raw.items()}
+        except ValueError:
+            pass
+
+        return stats_out
 
     def _append_episode_metadata(
         self,
@@ -270,6 +361,7 @@ class DatasetWriter:
         from_index: int,
         to_index: int,
         video_results: dict[str, EncoderResult],
+        scalar_stats: dict[str, dict[str, list]] | None = None,
     ):
         """Append episode metadata row and rewrite the metadata parquet."""
         chunk, file_idx = self._chunk_file(ep_index)
@@ -286,7 +378,7 @@ class DatasetWriter:
             "dataset_to_index": to_index,
         }
 
-        # Per-video metadata
+        # Per-video metadata + stats
         for cam_key, result in video_results.items():
             vk = f"observation.images.{cam_key}"
             v_chunk, v_file = self._chunk_file(ep_index)
@@ -295,15 +387,14 @@ class DatasetWriter:
             row[f"videos/{vk}/from_timestamp"] = 0.0
             row[f"videos/{vk}/to_timestamp"] = result.frame_count / self.fps
 
-            # Per-episode stats (stored as lists in the metadata parquet)
             for stat_key, stat_val in result.stats.items():
                 row[f"stats/{vk}/{stat_key}"] = stat_val.tolist()
 
-        # Scalar feature stats for this episode
-        # (We compute these from the scalar_frames passed to save_episode,
-        #  but the caller already moved on. We'll compute them from the
-        #  aggregate stats update instead — the per-episode stats are optional
-        #  in the metadata parquet for scalar features.)
+        # Per-episode scalar stats (observation.state, action, timestamp, etc.)
+        if scalar_stats:
+            for feat_key, feat_stats in scalar_stats.items():
+                for stat_key, stat_val in feat_stats.items():
+                    row[f"stats/{feat_key}/{stat_key}"] = stat_val
 
         self._episode_rows.append(row)
         self._write_episodes_parquet()
