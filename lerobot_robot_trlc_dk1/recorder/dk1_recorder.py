@@ -393,10 +393,64 @@ def main():
     if rerun_enabled:
         try:
             import rerun as rr
+            import rerun.blueprint as rrb
+
+            # Build explicit content lists (globs don't work reliably)
+            _left_joints = [f"left_joint_{i}" for i in range(1, 7)] + ["left_gripper"]
+            _right_joints = [f"right_joint_{i}" for i in range(1, 7)] + ["right_gripper"]
+
+            def _arm_tabs(joints, side):
+                """Build Pos/Vel/Torque tabs for one arm."""
+                return rrb.Tabs(
+                    rrb.TimeSeriesView(
+                        name=f"{side} Positions",
+                        origin="/",
+                        contents=[
+                            f"+ follower/{j}.pos" for j in joints
+                        ] + [
+                            f"+ leader/{j}.pos" for j in joints
+                        ],
+                    ),
+                    rrb.TimeSeriesView(
+                        name=f"{side} Velocities",
+                        origin="/",
+                        contents=[
+                            f"+ follower/{j}.vel"
+                            for j in joints if "gripper" not in j
+                        ],
+                    ),
+                    rrb.TimeSeriesView(
+                        name=f"{side} Torques",
+                        origin="/",
+                        contents=[
+                            f"+ follower/{j}.torque" for j in joints
+                        ],
+                    ),
+                )
+
+            blueprint = rrb.Blueprint(
+                rrb.Vertical(
+                    # Top row: 3 camera feeds side by side
+                    rrb.Horizontal(
+                        rrb.Spatial2DView(name="Head", origin="cameras/head"),
+                        rrb.Spatial2DView(name="Left Wrist", origin="cameras/left_wrist"),
+                        rrb.Spatial2DView(name="Right Wrist", origin="cameras/right_wrist"),
+                    ),
+                    # Bottom row: left arm | right arm, each with Pos/Vel/Torque tabs
+                    rrb.Horizontal(
+                        _arm_tabs(_left_joints, "Left"),
+                        _arm_tabs(_right_joints, "Right"),
+                    ),
+                    row_shares=[3, 2],  # cameras 60%, plots 40%
+                ),
+                collapse_panels=True,
+            )
+
             rr.init("dk1-recorder")
             rr.spawn(
                 memory_limit=os.environ.get("LEROBOT_RERUN_MEMORY_LIMIT", "10%")
             )
+            rr.send_blueprint(blueprint)
         except ImportError:
             logger.warning("rerun-sdk not installed, disabling visualization")
             rerun_enabled = False
