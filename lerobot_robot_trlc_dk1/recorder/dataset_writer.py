@@ -40,6 +40,11 @@ logger = logging.getLogger(__name__)
 # Feature schema builder
 # ---------------------------------------------------------------------------
 
+def _ordered_dict(*pairs) -> dict:
+    """Create a dict preserving insertion order (for JSON key order)."""
+    return dict(pairs)
+
+
 def build_features_schema(
     camera_keys: list[str],
     camera_height: int,
@@ -47,32 +52,32 @@ def build_features_schema(
     fps: int,
     video_codec: str = "h264",
 ) -> dict:
-    """Build the ``features`` dict for info.json."""
+    """Build the ``features`` dict for info.json.
+
+    Feature order matches LeRobot reference datasets:
+    action → observation.state → video features → metadata columns.
+    Key order within features: dtype, names, shape (matching reference).
+    """
     features: dict = {}
 
-    # Video features
-    for cam_key in camera_keys:
-        features[f"observation.images.{cam_key}"] = {
-            "dtype": "video",
-            "shape": [camera_height, camera_width, 3],
-            "names": ["height", "width", "channels"],
-            "info": {
-                "video.height": camera_height,
-                "video.width": camera_width,
-                "video.codec": video_codec,
-                "video.pix_fmt": "yuv420p",
-                "video.fps": fps,
-                "video.channels": 3,
-                "video.is_depth_map": False,
-                "has_audio": False,
-            },
-        }
+    # Action FIRST (matching reference dataset order)
+    features["action"] = _ordered_dict(
+        ("dtype", "float32"),
+        ("names", [
+            "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
+            "left_joint_4.pos", "left_joint_5.pos", "left_joint_6.pos",
+            "left_gripper.pos",
+            "right_joint_1.pos", "right_joint_2.pos", "right_joint_3.pos",
+            "right_joint_4.pos", "right_joint_5.pos", "right_joint_6.pos",
+            "right_gripper.pos",
+        ]),
+        ("shape", [14]),
+    )
 
-    # Observation state: 40 floats (6 joints × {pos,vel,torque} × 2 arms + 2 grippers × {pos,torque})
-    features["observation.state"] = {
-        "dtype": "float32",
-        "shape": [40],
-        "names": [
+    # Observation state SECOND
+    features["observation.state"] = _ordered_dict(
+        ("dtype", "float32"),
+        ("names", [
             "left_joint_1.pos", "left_joint_1.vel", "left_joint_1.torque",
             "left_joint_2.pos", "left_joint_2.vel", "left_joint_2.torque",
             "left_joint_3.pos", "left_joint_3.vel", "left_joint_3.torque",
@@ -87,29 +92,34 @@ def build_features_schema(
             "right_joint_5.pos", "right_joint_5.vel", "right_joint_5.torque",
             "right_joint_6.pos", "right_joint_6.vel", "right_joint_6.torque",
             "right_gripper.pos", "right_gripper.torque",
-        ],
-    }
+        ]),
+        ("shape", [40]),
+    )
 
-    # Action: 14 floats (6 joint positions + gripper × 2 arms)
-    features["action"] = {
-        "dtype": "float32",
-        "shape": [14],
-        "names": [
-            "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
-            "left_joint_4.pos", "left_joint_5.pos", "left_joint_6.pos",
-            "left_gripper.pos",
-            "right_joint_1.pos", "right_joint_2.pos", "right_joint_3.pos",
-            "right_joint_4.pos", "right_joint_5.pos", "right_joint_6.pos",
-            "right_gripper.pos",
-        ],
-    }
+    # Video features THIRD
+    for cam_key in camera_keys:
+        features[f"observation.images.{cam_key}"] = _ordered_dict(
+            ("dtype", "video"),
+            ("shape", [camera_height, camera_width, 3]),
+            ("names", ["height", "width", "channels"]),
+            ("info", {
+                "video.height": camera_height,
+                "video.width": camera_width,
+                "video.codec": video_codec,
+                "video.pix_fmt": "yuv420p",
+                "video.is_depth_map": False,
+                "video.fps": fps,
+                "video.channels": 3,
+                "has_audio": False,
+            }),
+        )
 
-    # Scalar metadata columns
-    features["timestamp"] = {"dtype": "float32", "shape": [1]}
-    features["frame_index"] = {"dtype": "int64", "shape": [1]}
-    features["episode_index"] = {"dtype": "int64", "shape": [1]}
-    features["index"] = {"dtype": "int64", "shape": [1]}
-    features["task_index"] = {"dtype": "int64", "shape": [1]}
+    # Scalar metadata columns LAST (names: null required by LeRobot reference format)
+    features["timestamp"] = _ordered_dict(("dtype", "float32"), ("shape", [1]), ("names", None))
+    features["frame_index"] = _ordered_dict(("dtype", "int64"), ("shape", [1]), ("names", None))
+    features["episode_index"] = _ordered_dict(("dtype", "int64"), ("shape", [1]), ("names", None))
+    features["index"] = _ordered_dict(("dtype", "int64"), ("shape", [1]), ("names", None))
+    features["task_index"] = _ordered_dict(("dtype", "int64"), ("shape", [1]), ("names", None))
 
     return features
 
@@ -251,24 +261,19 @@ class DatasetWriter:
         timestamps = [float(f["timestamp"]) for f in frames]
         task_indices = [f["task_index"] for f in frames]
 
-        # Vector features as fixed-size lists of float32
-        # (matching LeRobot's HuggingFace Sequence format: fixed_size_list<float>[N])
-        obs_dim = len(frames[0]["observation.state"])
-        act_dim = len(frames[0]["action"])
+        # Vector features as variable-length lists of float32.
+        # hyparquet (JS reader used by HF visualizer) cannot read
+        # fixed_size_list — it requires plain list<float>.
         obs_states = [f["observation.state"].tolist() for f in frames]
         actions = [f["action"].tolist() for f in frames]
+        obs_dim = len(obs_states[0])
+        act_dim = len(actions[0])
 
         # Column order matches LeRobot reference datasets:
         # action, observation.state first, then metadata columns
         table = pa.table({
-            "action": pa.FixedSizeListArray.from_arrays(
-                pa.array([v for row in actions for v in row], type=pa.float32()),
-                list_size=act_dim,
-            ),
-            "observation.state": pa.FixedSizeListArray.from_arrays(
-                pa.array([v for row in obs_states for v in row], type=pa.float32()),
-                list_size=obs_dim,
-            ),
+            "action": pa.array(actions, type=pa.list_(pa.float32())),
+            "observation.state": pa.array(obs_states, type=pa.list_(pa.float32())),
             "timestamp": pa.array(timestamps, type=pa.float32()),
             "frame_index": pa.array(frame_indices, type=pa.int64()),
             "episode_index": pa.array(episode_indices, type=pa.int64()),
@@ -459,6 +464,11 @@ class DatasetWriter:
 
     # -- info.json ----------------------------------------------------------
 
+    def _compute_dir_size_mb(self, dir_path: Path, pattern: str) -> int:
+        """Compute total size of files matching pattern in directory, in MB."""
+        total = sum(f.stat().st_size for f in dir_path.rglob(pattern)) if dir_path.exists() else 0
+        return round(total / (1024 * 1024))
+
     def _write_info_json(self):
         """Write meta/info.json with current totals."""
         info = {
@@ -468,8 +478,8 @@ class DatasetWriter:
             "total_frames": self.global_frame_index,
             "total_tasks": 1,
             "chunks_size": self.chunks_size,
-            "data_files_size_in_mb": 100,
-            "video_files_size_in_mb": 999999,
+            "data_files_size_in_mb": self._compute_dir_size_mb(self.dataset_dir / "data", "*.parquet"),
+            "video_files_size_in_mb": self._compute_dir_size_mb(self.dataset_dir / "videos", "*.mp4"),
             "fps": self.fps,
             "splits": {"train": f"0:{self.total_episodes}"},
             "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
