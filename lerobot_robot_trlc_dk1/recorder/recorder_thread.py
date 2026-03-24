@@ -361,7 +361,15 @@ class RecorderThread:
             )
 
     def _log_rerun(self, obs: dict, obs_state: np.ndarray, action_vec: np.ndarray):
-        """Log current frame to Rerun viewer."""
+        """Log current frame to Rerun viewer.
+
+        Layout: follower state under follower/, leader commands under leader/.
+        Follower lines are thick (width=2), leader lines are thin (width=1)
+        with gray color to visually distinguish command vs actual.
+
+        Style (SeriesLines) and data (Scalars) are logged in the SAME call
+        to avoid creating ghost zero-value rows.
+        """
         try:
             import rerun as rr
 
@@ -369,30 +377,24 @@ class RecorderThread:
             rr.set_time("frame", sequence=self.frame_index)
 
             # Camera images — static=True so only latest frame is kept in memory.
-            # Without this, Rerun accumulates ~237 MB/s of image data.
             for cam_key in self.camera_keys:
                 image = obs.get(cam_key)
                 if image is not None:
                     rr.log(f"cameras/{cam_key}", rr.Image(image), static=True)
 
-            # Joint positions
+            # Follower actual state — thick lines, auto-colored
             for i, name in enumerate(OBS_STATE_KEYS):
-                if ".pos" in name:
-                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
+                rr.log(f"follower/{name}",
+                       rr.Scalars([obs_state[i]]),
+                       rr.SeriesLines(widths=2.0, names=[f"fol/{name}"]))
 
-            # Joint velocities
-            for i, name in enumerate(OBS_STATE_KEYS):
-                if ".vel" in name:
-                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
-
-            # Joint torques
-            for i, name in enumerate(OBS_STATE_KEYS):
-                if ".torque" in name:
-                    rr.log(f"observation/{name}", rr.Scalars([obs_state[i]]))
-
-            # Actions
+            # Leader commanded positions — thin gray lines
             for i, name in enumerate(ACTION_KEYS):
-                rr.log(f"action/{name}", rr.Scalars([action_vec[i]]))
+                rr.log(f"leader/{name}",
+                       rr.Scalars([action_vec[i]]),
+                       rr.SeriesLines(widths=1.0,
+                                      colors=[[180, 180, 180]],
+                                      names=[f"ldr/{name}"]))
 
         except Exception:
             if self.frame_index <= 2:
