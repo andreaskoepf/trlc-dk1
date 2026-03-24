@@ -12,6 +12,12 @@ dependencies = [
   "dynamixel-sdk>=3.7.31",
   "lerobot@https://github.com/huggingface/lerobot.git",
   "mujoco>=3.0.0",
+  "torch>=2.10.0",
+  "torchcodec>=0.10.0",
+  "torchvision>=0.25.0",
+  "opencv-contrib-python>=4.10.0",
+  "av>=14.0.0",
+  "pyarrow>=18.0.0",
 ]
 authors = [
   {name = "Jannik Grothusen", email = "jannik@robot-learning.co"},
@@ -20,12 +26,25 @@ maintainers = [
   {name = "Jannik Grothusen", email = "jannik@robot-learning.co"},
 ]
 
+[project.scripts]
+dk1-record = "lerobot_robot_trlc_dk1.recorder.dk1_recorder:main"
+
 [project.optional-dependencies]
 rt = []  # C++ extension is built by scikit-build-core when installed
 
 [project.urls]
 Homepage = "https://www.robot-learning.co/"
 Documentation = "https://www.docs.robot-learning.co/"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchcodec = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [tool.scikit-build]
 cmake.source-dir = "csrc"
