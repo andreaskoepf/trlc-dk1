@@ -132,10 +132,22 @@ class RecorderThread:
         except ImportError:
             pass
 
+        # Gesture detection at recording rate (30 Hz, not 20 Hz event loop)
+        self.gesture_triggered = threading.Event()
+        self._gesture_left = None
+        self._gesture_right = None
+        try:
+            from lerobot_robot_trlc_dk1.recorder.gesture_detector import GripperGestureDetector
+            self._gesture_left = GripperGestureDetector()
+            self._gesture_right = GripperGestureDetector()
+        except ImportError:
+            pass
+
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._actual_fps: float = 0.0
         self._drop_count: int = 0
+        self._rerun_global_frame: int = 0
 
     @property
     def actual_fps(self) -> float:
@@ -169,6 +181,7 @@ class RecorderThread:
         self.episode_buffer = []
         self._drop_count = 0
         self.rest_pose_triggered.clear()
+        self.gesture_triggered.clear()
 
         # Reset rest pose detector (will capture pose on first frame)
         if self._rest_pose_detector is not None:
@@ -209,8 +222,9 @@ class RecorderThread:
 
         while not self._stop_event.is_set():
             if not self.recording.is_set():
-                # Idle — wait efficiently
-                self.recording.wait(timeout=0.05)
+                # Idle — still poll gestures at ~30 Hz for start detection
+                self._poll_gestures()
+                time.sleep(1.0 / self.fps)
                 continue
 
             t0 = time.perf_counter()
@@ -295,6 +309,9 @@ class RecorderThread:
         if action is None:
             return  # Teleop not started yet
 
+        # 3b. Poll gesture detectors at recording rate (30 Hz)
+        self._poll_gestures()
+
         # 4. Dispatch camera frames to encoder queues (non-blocking)
         for cam_key in self.camera_keys:
             image = obs.get(cam_key)
@@ -360,6 +377,18 @@ class RecorderThread:
                 total_ms,
             )
 
+    def _poll_gestures(self):
+        """Check gripper gesture detectors using latest teleop action."""
+        if self._gesture_left is None:
+            return
+        action = self.teleop.latest_action
+        if action is None:
+            return
+        left = action.get("left_gripper.pos", 0)
+        right = action.get("right_gripper.pos", 0)
+        if self._gesture_left.update(left) or self._gesture_right.update(right):
+            self.gesture_triggered.set()
+
     def _log_rerun(self, obs: dict, obs_state: np.ndarray, action_vec: np.ndarray):
         """Log current frame to Rerun viewer.
 
@@ -373,8 +402,8 @@ class RecorderThread:
         try:
             import rerun as rr
 
-            # Set timeline so scalars appear as time series
-            rr.set_time("frame", sequence=self.frame_index)
+            rr.set_time("frame", sequence=self._rerun_global_frame)
+            self._rerun_global_frame += 1
 
             # Camera images — static=True so only latest frame is kept in memory.
             for cam_key in self.camera_keys:
@@ -382,19 +411,13 @@ class RecorderThread:
                 if image is not None:
                     rr.log(f"cameras/{cam_key}", rr.Image(image), static=True)
 
-            # Follower actual state — thick lines, auto-colored
+            # Follower actual state
             for i, name in enumerate(OBS_STATE_KEYS):
-                rr.log(f"follower/{name}",
-                       rr.Scalars([obs_state[i]]),
-                       rr.SeriesLines(widths=2.0, names=[f"fol/{name}"]))
+                rr.log(f"follower/{name}", rr.Scalars([obs_state[i]]))
 
-            # Leader commanded positions — thin gray lines
+            # Leader commanded positions
             for i, name in enumerate(ACTION_KEYS):
-                rr.log(f"leader/{name}",
-                       rr.Scalars([action_vec[i]]),
-                       rr.SeriesLines(widths=1.0,
-                                      colors=[[180, 180, 180]],
-                                      names=[f"ldr/{name}"]))
+                rr.log(f"leader/{name}", rr.Scalars([action_vec[i]]))
 
         except Exception:
             if self.frame_index <= 2:

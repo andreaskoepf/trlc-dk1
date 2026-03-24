@@ -44,9 +44,9 @@ class GripperGestureDetector:
 
     def __init__(
         self,
-        threshold_close: float = 0.85,
-        threshold_open: float = 0.3,
-        double_close_window_s: float = 0.8,
+        threshold_close: float = 0.70,
+        threshold_open: float = 0.45,
+        double_close_window_s: float = 1.2,
     ):
         self.threshold_close = threshold_close
         self.threshold_open = threshold_open
