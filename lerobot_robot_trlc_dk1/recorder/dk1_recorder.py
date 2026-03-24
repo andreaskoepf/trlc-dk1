@@ -662,7 +662,7 @@ def _run_event_loop(
     # Number of frames to trim from end of episode when stop gesture detected.
     # Removes the double-close gesture motion from the training data.
     # Conservative: ceil(double_close_window_s * fps) ≈ 24 frames at 30fps.
-    STOP_TRIM_FRAMES = int(0.8 * fps) + fps // 2  # ~39 frames (~1.3s) to be safe
+    STOP_TRIM_FRAMES = int(1.2 * fps) + fps // 2  # ~51 frames (~1.7s) to cover 1.2s gesture window
 
     # Gripper open threshold for STARTING state (both grippers must be below this)
     GRIPPER_OPEN_THRESHOLD = 0.3
@@ -686,17 +686,13 @@ def _run_event_loop(
             # Fallback: non-blocking stdin read (works without terminal_ui)
             key_event = _poll_stdin_nonblocking()
 
-        # -- Poll gesture detectors -----------------------------------------
+        # -- Poll gesture detectors (fed at 30 Hz from recorder thread) ------
         gesture_triggered = False
         cooldown_active = (time.monotonic() - last_transition_time) < GESTURE_COOLDOWN_S
-        if not cooldown_active and gesture_left is not None and gesture_right is not None:
-            action = teleop.latest_action
-            if action is not None:
-                if gesture_left.update(action.get("left_gripper.pos", 0)):
-                    gesture_triggered = True
-                if gesture_right.update(action.get("right_gripper.pos", 0)):
-                    gesture_triggered = True
-            if gesture_triggered and audio is not None:
+        if not cooldown_active and recorder.gesture_triggered.is_set():
+            gesture_triggered = True
+            recorder.gesture_triggered.clear()
+            if audio is not None:
                 audio.gesture_detected()
 
         # -- Check if both grippers are open (for STARTING state) -----------
