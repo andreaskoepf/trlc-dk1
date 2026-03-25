@@ -219,10 +219,28 @@ class DatasetWriter:
         self.total_episodes = ep_index + 1
         self._write_info_json()
 
-        logger.info(
-            "Episode %d saved: %d frames, global_index %d→%d",
-            ep_index, n_frames, from_index, to_index,
-        )
+        # Log with video frame breakdown
+        vr = next(iter(video_results.values()), None) if video_results else None
+        if vr:
+            tail = vr.frame_count - n_frames
+            total_mp4 = vr.pts_offset + vr.frame_count
+            parts = []
+            if vr.pts_offset > 0:
+                parts.append(f"{vr.pts_offset} pre-roll")
+            parts.append(f"{n_frames} episode")
+            if tail > 0:
+                parts.append(f"{tail} tail")
+            logger.info(
+                "Episode %d saved: %d frames, global_index %d→%d, "
+                "video %s = %d total frames",
+                ep_index, n_frames, from_index, to_index,
+                " + ".join(parts), total_mp4,
+            )
+        else:
+            logger.info(
+                "Episode %d saved: %d frames, global_index %d→%d",
+                ep_index, n_frames, from_index, to_index,
+            )
 
     # -- Data parquet -------------------------------------------------------
 
@@ -383,8 +401,10 @@ class DatasetWriter:
             v_chunk, v_file = self._chunk_file(ep_index)
             row[f"videos/{vk}/chunk_index"] = v_chunk
             row[f"videos/{vk}/file_index"] = v_file
-            row[f"videos/{vk}/from_timestamp"] = 0.0
-            row[f"videos/{vk}/to_timestamp"] = n_frames / self.fps
+            # pts_offset accounts for NVENC priming frames at the start of the MP4.
+            # from_timestamp skips past them so the viewer starts at the real data.
+            row[f"videos/{vk}/from_timestamp"] = result.pts_offset / self.fps
+            row[f"videos/{vk}/to_timestamp"] = (n_frames + result.pts_offset) / self.fps
 
             for stat_key, stat_val in result.stats.items():
                 row[f"stats/{vk}/{stat_key}"] = stat_val.tolist()
