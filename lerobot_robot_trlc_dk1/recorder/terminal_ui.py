@@ -36,16 +36,49 @@ logger = logging.getLogger(__name__)
 class StatusLineLogHandler(logging.Handler):
     """Log handler that clears the pinned status line before printing.
 
-    Ensures log messages appear on their own line above the status bar
-    instead of overlapping with it.
+    Uses rich Console for colored output. Clears the current terminal line
+    before each log message so it doesn't overlap the pinned status bar.
     """
+
+    def __init__(self):
+        super().__init__()
+        self._console = None
+        self._rich_handler = None
+        try:
+            from io import StringIO
+            from rich.console import Console
+            from rich.logging import RichHandler
+
+            # RichHandler with a captured console so we can prepend \r\033[K
+            self._console_buf = StringIO()
+            self._console = Console(
+                file=self._console_buf, width=120, no_color=False, force_terminal=True,
+            )
+            self._rich_handler = RichHandler(
+                console=self._console,
+                show_path=False,
+                rich_tracebacks=True,
+            )
+        except ImportError:
+            pass
 
     def emit(self, record):
         try:
-            msg = self.format(record)
-            # Clear current line, print log, leave cursor on new line
-            sys.stderr.write(f"\r\033[K{msg}\n")
-            sys.stderr.flush()
+            if self._rich_handler and self._console:
+                # Render via rich, then extract the string
+                self._console_buf.truncate(0)
+                self._console_buf.seek(0)
+                self._rich_handler.emit(record)
+                self._console_buf.seek(0)
+                rendered = self._console_buf.read()
+                if rendered:
+                    # Clear status line, print rendered log, status redraws next tick
+                    sys.stderr.write(f"\r\033[K{rendered}")
+                    sys.stderr.flush()
+            else:
+                msg = self.format(record)
+                sys.stderr.write(f"\r\033[K{msg}\n")
+                sys.stderr.flush()
         except Exception:
             self.handleError(record)
 
