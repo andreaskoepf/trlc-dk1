@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # Full observation keys (pos + vel + torque) — 40 elements
-_ALL_OBS_STATE_KEYS = [
+OBS_STATE_KEYS = [
     "left_joint_1.pos", "left_joint_1.vel", "left_joint_1.torque",
     "left_joint_2.pos", "left_joint_2.vel", "left_joint_2.torque",
     "left_joint_3.pos", "left_joint_3.vel", "left_joint_3.torque",
@@ -64,10 +64,8 @@ _ALL_OBS_STATE_KEYS = [
     "right_joint_5.pos", "right_joint_5.vel", "right_joint_5.torque",
     "right_joint_6.pos", "right_joint_6.vel", "right_joint_6.torque",
     "right_gripper.pos", "right_gripper.torque",
-]  # 40 elements
-
-# Default: full signal set
-OBS_STATE_KEYS = _ALL_OBS_STATE_KEYS
+]  # 40 elements — always the full signal set internally.
+# Filtering for dataset storage happens at the output boundary.
 
 ACTION_KEYS = [
     "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
@@ -89,11 +87,11 @@ def build_obs_state_keys(signals: list[str]) -> list[str]:
     Returns:
         Filtered list of observation state keys.
     """
-    return [k for k in _ALL_OBS_STATE_KEYS if k.rsplit(".", 1)[1] in signals]
+    return [k for k in OBS_STATE_KEYS if k.rsplit(".", 1)[1] in signals]
 
 
 def pack_observation_state(obs: dict[str, float]) -> np.ndarray:
-    """Pack observation dict into float32 vector in documented order."""
+    """Pack observation dict into full float32[40] vector in documented order."""
     return np.array([obs[k] for k in OBS_STATE_KEYS], dtype=np.float32)
 
 
@@ -112,7 +110,7 @@ class RecorderThread:
     The recorder thread runs independently from the teleop thread. It:
     1. Reads observations from the follower (seqlock + cameras)
     2. Snapshots the latest action from the teleop thread
-    3. Packs obs→float32[N] (N depends on --obs-signals) and action→float32[14]
+    3. Packs obs→float32[40] (full state) and action→float32[14]
     4. Dispatches camera frames to per-camera encoder queues (non-blocking)
     5. Buffers scalar frames in memory for the dataset writer
 
@@ -128,6 +126,7 @@ class RecorderThread:
         camera_keys: list[str],
         fps: int = 30,
         rerun_enabled: bool = False,
+        rerun_obs_keys: list[str] | None = None,
     ):
         self.follower = follower
         self.teleop = teleop
@@ -135,6 +134,13 @@ class RecorderThread:
         self.camera_keys = camera_keys
         self.fps = fps
         self.rerun_enabled = rerun_enabled
+
+        # Precompute (index, name) pairs for Rerun obs logging.
+        # Only the signals selected by --obs-signals are sent to Rerun.
+        rr_keys = rerun_obs_keys if rerun_obs_keys is not None else OBS_STATE_KEYS
+        self._rerun_obs: list[tuple[int, str]] = [
+            (i, k) for i, k in enumerate(OBS_STATE_KEYS) if k in set(rr_keys)
+        ]
 
         # Recording state (controlled from main thread)
         self.recording = threading.Event()
@@ -153,6 +159,7 @@ class RecorderThread:
 
         # Gesture detection at recording rate (30 Hz, not 20 Hz event loop)
         self.gesture_triggered = threading.Event()
+        self.gesture_first_close_frame: int = 0  # frame_index at first close
         self._gesture_left = None
         self._gesture_right = None
         try:
@@ -463,7 +470,17 @@ class RecorderThread:
             return
         left = action.get("left_gripper.pos", 0)
         right = action.get("right_gripper.pos", 0)
-        if self._gesture_left.update(left) or self._gesture_right.update(right):
+        left_result = self._gesture_left.update(left)
+        right_result = self._gesture_right.update(right)
+        first_close_time = left_result or right_result
+        if first_close_time:
+            # Convert first-close wall time to frame index.
+            # Each frame is 1/fps apart; frame_index is current (about to
+            # be incremented). Estimate how many frames ago the first close
+            # happened based on elapsed time.
+            elapsed = time.monotonic() - first_close_time
+            frames_ago = int(elapsed * self.fps + 0.5)
+            self.gesture_first_close_frame = max(0, self.frame_index - frames_ago)
             self.gesture_triggered.set()
 
     # 14 distinct colors for joints: left arm = warm, right arm = cool.
@@ -500,7 +517,7 @@ class RecorderThread:
                 colors=[light], widths=[1.0],
             ), static=True)
 
-        for i, name in enumerate(OBS_STATE_KEYS):
+        for i, name in self._rerun_obs:
             # Map obs key to joint index (0-13) via its .pos counterpart
             base = name.rsplit(".", 1)[0]  # e.g. "left_joint_1"
             sig = name.rsplit(".", 1)[1]   # "pos", "vel", or "torque"
@@ -526,7 +543,7 @@ class RecorderThread:
             return
         self._init_rerun_styles()
         logger.info("Rerun styles initialized (%d obs + %d action series)",
-                     len(OBS_STATE_KEYS), len(ACTION_KEYS))
+                     len(self._rerun_obs), len(ACTION_KEYS))
 
     def _log_rerun(self, obs: dict, obs_state: np.ndarray, action_vec: np.ndarray):
         """Log current frame to Rerun viewer."""
@@ -542,8 +559,8 @@ class RecorderThread:
                 if image is not None:
                     rr.log(f"cameras/{cam_key}", rr.Image(image), static=True)
 
-            # Follower actual state
-            for i, name in enumerate(OBS_STATE_KEYS):
+            # Follower actual state (filtered to --obs-signals)
+            for i, name in self._rerun_obs:
                 rr.log(f"follower/{name}", rr.Scalars([obs_state[i]]))
 
             # Leader commanded positions

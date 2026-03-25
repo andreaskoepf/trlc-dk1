@@ -61,8 +61,8 @@ def build_features_schema(
     """
     # Default: full 40-element observation
     if obs_state_keys is None:
-        from lerobot_robot_trlc_dk1.recorder.recorder_thread import _ALL_OBS_STATE_KEYS
-        obs_state_keys = _ALL_OBS_STATE_KEYS
+        from lerobot_robot_trlc_dk1.recorder.recorder_thread import OBS_STATE_KEYS
+        obs_state_keys = OBS_STATE_KEYS
 
     features: dict = {}
 
@@ -136,6 +136,7 @@ class DatasetWriter:
         chunks_size: int = 1000,
         start_episode: int = 0,
         start_frame: int = 0,
+        obs_state_keys: list[str] | None = None,
     ):
         self.dataset_dir = Path(dataset_dir)
         self.fps = fps
@@ -146,6 +147,17 @@ class DatasetWriter:
 
         self.total_episodes = start_episode
         self.global_frame_index = start_frame
+
+        # Index mask for filtering the full 40-element observation vector
+        # down to the subset selected by --obs-signals for dataset storage.
+        from lerobot_robot_trlc_dk1.recorder.recorder_thread import OBS_STATE_KEYS
+        if obs_state_keys is None or len(obs_state_keys) == len(OBS_STATE_KEYS):
+            self._obs_indices: list[int] | None = None  # no filtering needed
+        else:
+            key_set = set(obs_state_keys)
+            self._obs_indices = [
+                i for i, k in enumerate(OBS_STATE_KEYS) if k in key_set
+            ]
 
         # Aggregate stats across all episodes for stats.json
         self._agg_stats: dict[str, RunningQuantileStats] = {}
@@ -273,7 +285,11 @@ class DatasetWriter:
         # Vector features as variable-length lists of float32.
         # hyparquet (JS reader used by HF visualizer) cannot read
         # fixed_size_list — it requires plain list<float>.
-        obs_states = [f["observation.state"].tolist() for f in frames]
+        # Filter observation vector to selected signals (--obs-signals).
+        if self._obs_indices is not None:
+            obs_states = [f["observation.state"][self._obs_indices].tolist() for f in frames]
+        else:
+            obs_states = [f["observation.state"].tolist() for f in frames]
         actions = [f["action"].tolist() for f in frames]
         obs_dim = len(obs_states[0])
         act_dim = len(actions[0])
@@ -452,8 +468,10 @@ class DatasetWriter:
         if not scalar_frames:
             return
 
-        # Observation state
+        # Observation state (filtered to stored signals)
         obs_batch = np.stack([f["observation.state"] for f in scalar_frames])
+        if self._obs_indices is not None:
+            obs_batch = obs_batch[:, self._obs_indices]
         if "observation.state" not in self._agg_stats:
             self._agg_stats["observation.state"] = RunningQuantileStats()
         self._agg_stats["observation.state"].update(obs_batch)
