@@ -42,7 +42,7 @@ class TeleopThread:
     ``leader.get_action()`` returns a fresh dict each call).
     """
 
-    def __init__(self, follower, leader, target_hz: float = 200.0):
+    def __init__(self, follower, leader, target_hz: float = 250.0):
         self.follower = follower
         self.leader = leader
         self.target_hz = target_hz

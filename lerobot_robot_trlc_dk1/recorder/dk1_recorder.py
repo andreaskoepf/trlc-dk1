@@ -174,8 +174,8 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Recording frames per second (default: 30)",
     )
     p.add_argument(
-        "--teleop-hz", type=float, default=200.0,
-        help="Teleop loop target frequency in Hz (default: 200)",
+        "--teleop-hz", type=float, default=250.0,
+        help="Teleop loop target frequency in Hz (default: 250)",
     )
     p.add_argument(
         "--codec", type=str, default="h264_nvenc",
@@ -596,9 +596,10 @@ def main():
   Teleop:  {args.teleop_hz:.0f} Hz
 
   {_B}Keyboard controls:{_N}
-    {_C}Space{_N}   Start recording / end episode (immediate)
-    {_C}R / Bksp{_N} Discard current episode and re-record
-    {_C}Q / Esc{_N} Stop recording and save dataset
+    {_C}Space{_N}     Start recording / end episode
+    {_C}R / Bksp{_N}  Discard current episode and re-record
+    {_C}T{_N}         Change task description (idle/waiting)
+    {_C}Q{_N}         Stop recording and save dataset
 
   {_B}Gripper gesture:{_N}
     Double-close either gripper (close → open → close within 0.8s)
@@ -941,6 +942,26 @@ def _run_event_loop(
                 logger.info("Start gesture detected — waiting for grippers to open")
                 _print_state(state, episode_index)
 
+        # Change task description (only in IDLE or WAITING)
+        if key_event == "task" and state in (RecorderState.IDLE, RecorderState.WAITING):
+            new_task = None
+            if ui is not None:
+                new_task = ui.prompt_text("New task description", writer.task)
+            else:
+                # Fallback without terminal UI
+                try:
+                    sys.stdout.write(f"\r\033[K  New task [{writer.task}]: ")
+                    sys.stdout.flush()
+                    text = input().strip()
+                    new_task = text if text else writer.task
+                except (EOFError, KeyboardInterrupt):
+                    pass
+            if new_task and new_task != writer.task:
+                writer.task = new_task
+                writer._write_tasks_parquet()
+                writer._write_info_json()
+                logger.info("Task updated: %s", new_task)
+
         # Quit from any state
         if key_event == "quit":
             if state == RecorderState.RECORDING:
@@ -1061,7 +1082,7 @@ def _print_state(state: str, episode_index: int, countdown: int = 0):
     """Simple colored console status (used when terminal_ui is not available)."""
     if state == RecorderState.COUNTDOWN:
         if countdown > 0:
-            print(f"\r  {_Y}▸ {countdown}...{_R}  episode {episode_index} (Esc/Bksp=cancel)              ", end="", flush=True)
+            print(f"\r  {_Y}▸ {countdown}...{_R}  episode {episode_index} (Bksp=cancel)              ", end="", flush=True)
         else:
             print(f"\r  {_G}▸ GO!{_R}  episode {episode_index}                                          ", end="", flush=True)
     elif state == RecorderState.RECORDING:
@@ -1091,8 +1112,9 @@ def _poll_stdin_nonblocking() -> str | None:
         return "space"
     elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
         return "rerecord"
-    elif ch.lower() == "q" or ch == "\x1b":
+    elif ch.lower() == "q":
         return "quit"
+    # Ignore ESC and escape sequences (cursor keys etc.)
     return None
 
 
