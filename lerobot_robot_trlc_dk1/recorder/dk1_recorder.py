@@ -236,13 +236,26 @@ def main():
         except termios.error:
             pass
 
-    # Logging
+    # Logging — use rich for colored, compact output
     level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(name)s %(levelname)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    try:
+        from rich.logging import RichHandler
+        logging.basicConfig(
+            level=level,
+            format="%(message)s",
+            datefmt="[%H:%M:%S]",
+            handlers=[RichHandler(
+                rich_tracebacks=True,
+                tracebacks_show_locals=args.verbose,
+                show_path=False,
+            )],
+        )
+    except ImportError:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(name)s %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
 
     # Load port/camera config from env files
     ports = load_env_config(args.port_config)
@@ -552,10 +565,6 @@ def main():
         for h in root.handlers[:]:
             root.removeHandler(h)
         handler = StatusLineLogHandler()
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(name)s %(levelname)s: %(message)s",
-            datefmt="%H:%M:%S",
-        ))
         handler.setLevel(level)
         root.addHandler(handler)
     except ImportError:
