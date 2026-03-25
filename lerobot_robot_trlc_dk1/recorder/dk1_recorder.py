@@ -282,15 +282,15 @@ def main():
     # For the feature schema, strip encoder suffix (h264_nvenc → h264)
     video_codec = "h264" if "h264" in codec else "hevc"
 
-    # Parse --obs-signals and configure observation keys
-    import lerobot_robot_trlc_dk1.recorder.recorder_thread as _rec_mod
+    # Parse --obs-signals to determine which signals to store in the dataset.
+    # Internally the recorder always captures the full 40-element state vector;
+    # filtering happens at the output boundary (dataset parquet + Rerun views).
     obs_signals = [s.strip() for s in args.obs_signals.split(",")]
     valid_signals = {"pos", "vel", "torque"}
     if not set(obs_signals).issubset(valid_signals):
         logger.error("Invalid --obs-signals: %s (valid: pos, vel, torque)", args.obs_signals)
         sys.exit(1)
     obs_state_keys = build_obs_state_keys(obs_signals)
-    _rec_mod.OBS_STATE_KEYS = obs_state_keys  # override module-level default
     logger.info("Observation signals: %s (%d elements)", args.obs_signals, len(obs_state_keys))
 
     # Handle existing dataset
@@ -414,6 +414,7 @@ def main():
         task=args.task,
         start_episode=start_episode,
         start_frame=start_frame,
+        obs_state_keys=obs_state_keys,
     )
 
     # Teleop thread
@@ -501,6 +502,7 @@ def main():
         camera_keys=CAMERA_KEYS,
         fps=args.fps,
         rerun_enabled=rerun_enabled,
+        rerun_obs_keys=obs_state_keys,
     )
 
     # Initialize Rerun styles at startup (not during first frame recording)
@@ -604,7 +606,7 @@ def main():
   {_B}Gripper gesture:{_N}
     Double-close either gripper (close → open → close within 0.8s)
     Start: waits for grippers to fully open before recording
-    Stop:  trims gesture frames from episode tail (~1.3s)
+    Stop:  trims gesture frames from episode tail (250ms before first close)
 
   {_B}Auto-end:{_N}
     Episode ends automatically when both arms return to their
@@ -710,10 +712,9 @@ def _run_event_loop(
     GESTURE_COOLDOWN_S = 1.5
     MIN_FRAMES_PER_EPISODE = 10  # don't save episodes shorter than this
 
-    # Number of frames to trim from end of episode when stop gesture detected.
-    # Removes the double-close gesture motion from the training data.
-    # Conservative: ceil(double_close_window_s * fps) ≈ 24 frames at 30fps.
-    STOP_TRIM_FRAMES = int(1.2 * fps) + fps // 2  # ~51 frames (~1.7s) to cover 1.2s gesture window
+    # Extra margin (in frames) to trim before the first close of the
+    # double-close gesture, so we don't include the start of the grab.
+    STOP_TRIM_MARGIN = int(0.25 * fps)  # 250ms before first close
 
     # Gripper open threshold for STARTING state (both grippers must be below this)
     GRIPPER_OPEN_THRESHOLD = 0.3
@@ -883,10 +884,14 @@ def _run_event_loop(
                     # Rest pose detection already waited for settle, so trim
                     # just the settle window (those frames are at rest, not task).
                     if gesture_triggered:
-                        trim = STOP_TRIM_FRAMES
+                        # Trim relative to first close of the double-close gesture
+                        frames_since_first_close = (
+                            recorder.frame_index - recorder.gesture_first_close_frame
+                        )
+                        trim = frames_since_first_close + STOP_TRIM_MARGIN
                     elif rest_pose_end:
                         # Trim the settle period (robot was stationary at rest)
-                        trim = 30  # ~1s settle window
+                        trim = fps  # ~1s settle window
                         if audio is not None:
                             audio.gesture_detected()  # audible confirmation
                         logger.info(

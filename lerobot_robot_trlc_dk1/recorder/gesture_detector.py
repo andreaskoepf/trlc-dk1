@@ -58,14 +58,16 @@ class GripperGestureDetector:
         self._last_close_time: float | None = None
         self._close_count: int = 0
 
-    def update(self, gripper_pos: float) -> bool:
+    def update(self, gripper_pos: float) -> float | None:
         """Feed a gripper position sample.
 
         Args:
             gripper_pos: Current gripper position (0=open, 1=closed).
 
         Returns:
-            True when a double-close gesture is detected.
+            None normally.  On double-close detection returns the
+            ``time.monotonic()`` timestamp of the **first** close so the
+            caller can trim precisely relative to the gesture start.
         """
         is_closed = gripper_pos >= self.threshold_close
         now = time.monotonic()
@@ -78,8 +80,9 @@ class GripperGestureDetector:
             ):
                 self._close_count += 1
                 if self._close_count >= 2:
+                    first_close_time = self._last_close_time
                     self._reset()
-                    return True  # Double-close detected!
+                    return first_close_time  # Double-close detected!
             else:
                 self._close_count = 1
             self._last_close_time = now
@@ -97,4 +100,4 @@ class GripperGestureDetector:
         ):
             self._close_count = 0
 
-        return False
+        return None

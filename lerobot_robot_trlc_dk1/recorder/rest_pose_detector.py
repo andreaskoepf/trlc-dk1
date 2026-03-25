@@ -61,18 +61,18 @@ class RestPoseDetector:
         self,
         pos_tolerance_rad: float = 0.25,       # ~14 degrees — your actual return error is ~0.15
         departure_threshold_rad: float = 0.5,  # ~29 degrees — must move this far to arm detection
-        vel_tolerance_rad_s: float = 0.8,       # impedance controller oscillates during settle
+        vel_tolerance_rad_s: float = 0.1,
         gripper_open_threshold: float = 0.25,   # grippers must be mostly open
-        settle_frames: int = 30,                # ~1 second at 30fps
-        min_episode_frames: int = 90,           # ~3 seconds minimum episode
+        settle_seconds: float = 1.0,
+        min_episode_seconds: float = 3.0,
         fps: int = 30,
     ):
         self.pos_tolerance_rad = pos_tolerance_rad
         self.departure_threshold_rad = departure_threshold_rad
         self.vel_tolerance_rad_s = vel_tolerance_rad_s
         self.gripper_open_threshold = gripper_open_threshold
-        self.settle_frames = settle_frames
-        self.min_episode_frames = min_episode_frames
+        self.settle_frames = int(settle_seconds * fps)
+        self.min_episode_frames = int(min_episode_seconds * fps)
         self.fps = fps
 
         self._rest_pose: np.ndarray | None = None  # joint positions at episode start
