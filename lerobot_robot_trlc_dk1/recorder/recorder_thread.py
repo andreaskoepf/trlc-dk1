@@ -167,6 +167,7 @@ class RecorderThread:
         self._actual_fps: float = 0.0
         self._drop_count: int = 0
         self._rerun_global_frame: int = 0
+        self._pre_rolling: bool = False  # cameras rolling before episode start
 
     @property
     def actual_fps(self) -> float:
@@ -194,22 +195,32 @@ class RecorderThread:
     # -- Episode control (called from main thread) --------------------------
 
     def prepare_episode(self, episode_index: int):
-        """Pre-open encoder containers and run GC before recording.
+        """Pre-open encoder containers, start cameras rolling, and run GC.
 
         Call during the countdown to move expensive work (av.open,
         NVENC session setup, GC) out of the recording hot path.
+        Cameras start rolling immediately — encoders accept frames
+        from this point. StartEpisode later marks the real episode boundary.
         """
         # Collect garbage now so it doesn't trigger during recording
         gc.collect()
 
-        # Pre-open MP4 containers in each encoder thread
+        # Tell encoders to open containers and start accepting frames
         for enc in self.encoders.values():
             enc.frame_queue.put(PrepareEpisode(episode_index))
 
-        logger.info("Episode %d: pre-init (GC + NVENC prime) — brief jitter expected", episode_index)
+        # Start dispatching camera frames to encoders (pre-roll)
+        self._pre_rolling = True
+
+        logger.info("Episode %d: pre-init (GC + NVENC) — cameras rolling", episode_index)
 
     def begin_episode(self, episode_index: int):
-        """Signal encoders and start recording frames."""
+        """Signal encoders and start recording frames.
+
+        If prepare_episode() was called earlier, encoders are already rolling
+        and this just marks the episode boundary. Otherwise, encoders open
+        containers on the fly (slower, ~500ms NVENC init on first frame).
+        """
         self.episode_index = episode_index
         self.frame_index = 0
         self.episode_buffer = []
@@ -221,7 +232,8 @@ class RecorderThread:
         if self._rest_pose_detector is not None:
             self._rest_pose_detector.reset()
 
-        # Tell encoders to start accepting frames (containers already open)
+        # Mark episode boundary in encoders (they may already be rolling)
+        self._pre_rolling = False
         for enc in self.encoders.values():
             enc.frame_queue.put(StartEpisode(episode_index))
 
@@ -257,6 +269,9 @@ class RecorderThread:
 
         while not self._stop_event.is_set():
             if not self.recording.is_set():
+                if self._pre_rolling:
+                    # Cameras rolling during countdown — dispatch to encoders only
+                    self._dispatch_pre_roll()
                 # Idle — still poll gestures at ~30 Hz for start detection
                 self._poll_gestures()
                 time.sleep(1.0 / self.fps)
@@ -418,6 +433,26 @@ class RecorderThread:
                 (t_rerun - t_rest) * 1000,
                 total_ms,
             )
+
+    def _dispatch_pre_roll(self):
+        """Dispatch camera frames to encoders during pre-roll (countdown).
+
+        Only sends video frames — no scalar data is buffered. This keeps the
+        NVENC pipeline warm so the first real episode frame encodes instantly.
+        """
+        for cam_key in self.camera_keys:
+            try:
+                cam = self.follower.cameras.get(cam_key)
+                if cam is None:
+                    continue
+                image = cam.async_read()
+                encoder = self.encoders.get(cam_key)
+                if encoder is not None:
+                    encoder.frame_queue.put_nowait(VideoFrame(0, image))
+            except (TimeoutError, queue.Full):
+                pass
+            except Exception:
+                pass
 
     def _poll_gestures(self):
         """Check gripper gesture detectors using latest teleop action."""

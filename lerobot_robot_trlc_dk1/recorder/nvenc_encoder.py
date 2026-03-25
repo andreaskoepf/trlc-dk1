@@ -41,13 +41,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PrepareEpisode:
-    """Pre-open MP4 container during countdown (before recording starts)."""
+    """Pre-open MP4 container and start encoding (cameras rolling)."""
     episode_index: int
 
 
 @dataclass
 class StartEpisode:
-    """Signal the encoder to begin accepting frames."""
+    """Mark the start of the real episode data in an already-rolling encoder."""
     episode_index: int
 
 
@@ -70,6 +70,7 @@ class EncoderResult:
     episode_index: int
     mp4_path: Path
     frame_count: int
+    pts_offset: int = 0  # number of priming frames before real data
     stats: dict[str, np.ndarray] = field(default_factory=dict)
 
 
@@ -230,19 +231,24 @@ class NvencEncoder:
             if msg is None:
                 break
             if isinstance(msg, PrepareEpisode):
-                # Pre-open container during countdown, then wait for StartEpisode
-                self._encode_episode(msg.episode_index, wait_for_start=True)
+                self._encode_episode(msg.episode_index, rolling=True)
             elif isinstance(msg, StartEpisode):
-                # No PrepareEpisode was sent — open + encode immediately (fallback)
-                self._encode_episode(msg.episode_index, wait_for_start=False)
+                # Fallback: no PrepareEpisode was sent — open + encode directly
+                self._encode_episode(msg.episode_index, rolling=False)
         logger.info("Encoder thread stopped: %s", self.cam_key)
 
-    def _open_container(self, ep_index: int, prime_encoder: bool = False):
-        """Open MP4 container and NVENC stream (expensive, do during countdown).
+    def _encode_episode(self, ep_index: int, rolling: bool = False):
+        """Encode frames for one episode into a single MP4.
 
-        If prime_encoder=True, encode and discard a dummy frame to force
-        NVENC lazy initialization (session setup, GPU buffer alloc) so the
-        first real frame encodes without a ~400ms GIL stall.
+        If rolling=True (PrepareEpisode path), the encoder opens the container
+        and immediately starts encoding frames from the queue (cameras rolling
+        during countdown). StartEpisode marks where the real episode begins.
+
+        If rolling=False (direct StartEpisode fallback), encoding starts
+        immediately with no pre-roll.
+
+        The MP4 contains: [pre-roll frames] [episode frames] [gesture frames]
+        Episode metadata from_timestamp/to_timestamp clips to the real data.
         """
         mp4_path = self._episode_path(ep_index)
         mp4_path.parent.mkdir(parents=True, exist_ok=True)
@@ -254,51 +260,15 @@ class NvencEncoder:
         stream.pix_fmt = "yuv420p"
         stream.options = self.codec_options
 
-        pts_offset = 0
-        if prime_encoder:
-            # Force NVENC lazy init by encoding+muxing a dummy black frame.
-            # This frame will be overwritten by the real first frame at pts=0,
-            # so we use pts=0 for the dummy and start real frames at pts=1.
-            dummy = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            vf = av.VideoFrame.from_ndarray(dummy, format="rgb24")
-            vf.pts = 0
-            for pkt in stream.encode(vf):
-                container.mux(pkt)
-            pts_offset = 1
-
-        logger.debug("Encoder %s: container pre-opened → %s", self.cam_key, mp4_path)
-        return container, stream, mp4_path, pts_offset
-
-    def _encode_episode(self, ep_index: int, wait_for_start: bool = True):
-        """Encode frames for one episode into a single MP4.
-
-        If wait_for_start=True (PrepareEpisode path), the container is opened
-        and NVENC is primed with a dummy frame during countdown.
-        If wait_for_start=False (direct StartEpisode), encoding starts immediately.
-        """
-        container, stream, mp4_path, pts_offset = self._open_container(
-            ep_index, prime_encoder=wait_for_start,
-        )
-
-        if wait_for_start:
-            # Wait for StartEpisode (container is ready, just waiting for GO)
-            while not self._stop:
-                try:
-                    msg = self.frame_queue.get(timeout=1.0)
-                except queue.Empty:
-                    continue
-                if msg is None:
-                    container.close()
-                    mp4_path.unlink(missing_ok=True)
-                    return
-                if isinstance(msg, StartEpisode):
-                    break
-                # Ignore other messages while waiting
-
-        frame_count = 0
+        total_frames = 0      # all frames in MP4 (pre-roll + episode)
+        episode_frames = 0    # frames after StartEpisode
+        pre_roll_frames = 0   # frames before StartEpisode
+        recording = not rolling  # if not rolling, we're recording immediately
         stats_frames: list[np.ndarray] = []
 
-        logger.debug("Encoder %s: episode %d recording", self.cam_key, ep_index)
+        logger.debug("Encoder %s: episode %d %s → %s",
+                      self.cam_key, ep_index,
+                      "rolling" if rolling else "recording", mp4_path)
 
         while True:
             try:
@@ -311,35 +281,46 @@ class NvencEncoder:
             if msg is None:
                 break
 
+            if isinstance(msg, StartEpisode):
+                # Mark the boundary: everything before is pre-roll
+                pre_roll_frames = total_frames
+                recording = True
+                logger.debug("Encoder %s: episode start at MP4 frame %d",
+                             self.cam_key, total_frames)
+                continue
+
             if isinstance(msg, EndEpisode):
                 break
 
             if not isinstance(msg, VideoFrame):
                 continue
 
-            # Encode frame (PyAV releases GIL during NVENC encode)
+            # Encode frame
             try:
                 video_frame = av.VideoFrame.from_ndarray(msg.image, format="rgb24")
-                video_frame.pts = frame_count + pts_offset
+                video_frame.pts = total_frames
                 for packet in stream.encode(video_frame):
                     container.mux(packet)
             except Exception:
-                if frame_count == 0:
+                if total_frames == 0:
                     logger.exception(
                         "Encoder %s: first frame encode failed (CUDA/NVENC init error?)",
                         self.cam_key,
                     )
                     break
                 else:
-                    logger.exception("Encoder %s: encode error at frame %d", self.cam_key, frame_count)
-                    frame_count += 1
+                    logger.exception("Encoder %s: encode error at frame %d",
+                                     self.cam_key, total_frames)
+                    total_frames += 1
                     continue
 
-            # Stash every Nth frame for deferred stats computation.
-            if frame_count % self.STATS_EVERY_N_FRAMES == 0:
+            # Stash every Nth frame for deferred stats (only during episode)
+            if recording and episode_frames % self.STATS_EVERY_N_FRAMES == 0:
                 stats_frames.append(msg.image)
 
-            frame_count += 1
+            total_frames += 1
+            if recording:
+                episode_frames += 1
 
         # Flush encoder
         for packet in stream.encode():
@@ -361,15 +342,14 @@ class NvencEncoder:
         result = EncoderResult(
             episode_index=ep_index,
             mp4_path=mp4_path,
-            frame_count=frame_count,
+            frame_count=episode_frames,
+            pts_offset=pre_roll_frames,
             stats=ep_stats,
         )
         self.result_queue.put(result)
 
         logger.debug(
-            "Encoder %s: episode %d done (%d frames, %.1f MB)",
-            self.cam_key,
-            ep_index,
-            frame_count,
+            "Encoder %s: episode %d done (%d pre-roll + %d episode frames, %.1f MB)",
+            self.cam_key, ep_index, pre_roll_frames, episode_frames,
             mp4_path.stat().st_size / 1e6 if mp4_path.exists() else 0,
         )
