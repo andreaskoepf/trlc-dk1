@@ -33,6 +33,23 @@ import tty
 logger = logging.getLogger(__name__)
 
 
+class StatusLineLogHandler(logging.Handler):
+    """Log handler that clears the pinned status line before printing.
+
+    Ensures log messages appear on their own line above the status bar
+    instead of overlapping with it.
+    """
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Clear current line, print log, leave cursor on new line
+            sys.stderr.write(f"\r\033[K{msg}\n")
+            sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
+
+
 class TerminalUI:
     """Terminal-based UI with pinned status line and keyboard input.
 

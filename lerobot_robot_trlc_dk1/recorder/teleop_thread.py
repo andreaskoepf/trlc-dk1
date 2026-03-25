@@ -53,6 +53,7 @@ class TeleopThread:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._actual_hz: float = 0.0
+        self._jitter_count: int = 0
 
     @property
     def latest_action(self) -> dict[str, float] | None:
@@ -63,6 +64,11 @@ class TeleopThread:
     def actual_hz(self) -> float:
         """Exponential-moving-average of actual loop rate."""
         return self._actual_hz
+
+    @property
+    def jitter_count(self) -> int:
+        """Number of cycles that exceeded 2× target period."""
+        return self._jitter_count
 
     def start(self):
         """Start the teleop thread."""
@@ -81,8 +87,10 @@ class TeleopThread:
 
     def _run(self):
         period = 1.0 / self.target_hz
+        jitter_threshold = period * 2.0  # warn when cycle > 2× target
         hz_filter = 0.0
         consecutive_errors = 0
+        last_jitter_log = 0.0  # throttle: max 1 warning per second
 
         while not self._stop_event.is_set():
             t0 = time.perf_counter()
@@ -118,3 +126,14 @@ class TeleopThread:
             hz = 1.0 / dt if dt > 0 else 0
             hz_filter = 0.95 * hz_filter + 0.05 * hz
             self._actual_hz = hz_filter
+
+            # Jitter detection: flag cycles that exceed 2× target period
+            if dt > jitter_threshold:
+                self._jitter_count += 1
+                now = time.monotonic()
+                if now - last_jitter_log > 1.0:
+                    logger.warning(
+                        "Teleop jitter: %.1f ms (target %.1f ms, total %d)",
+                        dt * 1000, period * 1000, self._jitter_count,
+                    )
+                    last_jitter_log = now

@@ -22,6 +22,7 @@ does NOT affect the teleop thread.
 
 from __future__ import annotations
 
+import gc
 import logging
 import queue
 import threading
@@ -34,6 +35,7 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot_robot_trlc_dk1.recorder.nvenc_encoder import (
     EndEpisode,
     NvencEncoder,
+    PrepareEpisode,
     StartEpisode,
     VideoFrame,
 )
@@ -191,6 +193,21 @@ class RecorderThread:
 
     # -- Episode control (called from main thread) --------------------------
 
+    def prepare_episode(self, episode_index: int):
+        """Pre-open encoder containers and run GC before recording.
+
+        Call during the countdown to move expensive work (av.open,
+        NVENC session setup, GC) out of the recording hot path.
+        """
+        # Collect garbage now so it doesn't trigger during recording
+        gc.collect()
+
+        # Pre-open MP4 containers in each encoder thread
+        for enc in self.encoders.values():
+            enc.frame_queue.put(PrepareEpisode(episode_index))
+
+        logger.debug("Episode %d: pre-open + GC done", episode_index)
+
     def begin_episode(self, episode_index: int):
         """Signal encoders and start recording frames."""
         self.episode_index = episode_index
@@ -204,7 +221,7 @@ class RecorderThread:
         if self._rest_pose_detector is not None:
             self._rest_pose_detector.reset()
 
-        # Tell each encoder to open a new MP4
+        # Tell encoders to start accepting frames (containers already open)
         for enc in self.encoders.values():
             enc.frame_queue.put(StartEpisode(episode_index))
 
@@ -218,6 +235,7 @@ class RecorderThread:
         their MP4 files and post results.
         """
         self.recording.clear()
+
 
         # Signal encoders to close current MP4
         for enc in self.encoders.values():
@@ -359,6 +377,7 @@ class RecorderThread:
             "task_index": 0,
         })
         self.frame_index += 1
+        t_pack = time.perf_counter()
 
         # 6. Rest pose auto-end detection
         if self._rest_pose_detector is not None:
@@ -377,20 +396,26 @@ class RecorderThread:
                     self.rest_pose_triggered.set()
         elif self.frame_index == 1:
             logger.warning("Rest pose detector not available")
+        t_rest = time.perf_counter()
 
         # 7. Log to Rerun (if enabled)
         if self.rerun_enabled:
             self._log_rerun(obs, obs_state, action_vec)
+        t_rerun = time.perf_counter()
 
         # Log timing for first few frames and periodically
         if self.frame_index <= 5 or self.frame_index % 100 == 0:
             total_ms = (time.perf_counter() - t_start) * 1000
-            logger.info(
-                "Frame %d: joints=%.1fms cams=%.1fms dispatch=%.1fms total=%.1fms",
+            logger.debug(
+                "Frame %d: joints=%.1fms cams=%.1fms dispatch=%.1fms "
+                "pack=%.1fms rest=%.1fms rerun=%.1fms total=%.1fms",
                 self.frame_index - 1,
                 (t_joints - t0) * 1000,
                 (t_cams - t_joints) * 1000,
                 (t_dispatch - t_cams) * 1000,
+                (t_pack - t_dispatch) * 1000,
+                (t_rest - t_pack) * 1000,
+                (t_rerun - t_rest) * 1000,
                 total_ms,
             )
 
@@ -406,16 +431,70 @@ class RecorderThread:
         if self._gesture_left.update(left) or self._gesture_right.update(right):
             self.gesture_triggered.set()
 
+    # 14 distinct colors for joints: left arm = warm, right arm = cool.
+    # Each has a dark variant (follower .pos) and light variant (leader .pos,
+    # follower .vel/.torque).
+    #                          dark (R,G,B)      light (R,G,B)
+    _JOINT_COLORS: list[tuple[tuple[int,int,int], tuple[int,int,int]]] = [
+        # Left arm (warm): joint 1-6, gripper
+        ((192, 48, 48),  (232, 144, 144)),  # red
+        ((192, 80, 32),  (232, 160, 128)),  # vermilion
+        ((192, 112, 16), (232, 184, 112)),  # orange
+        ((160, 144, 16), (208, 200, 96)),   # amber
+        ((96, 160, 32),  (168, 208, 112)),  # lime
+        ((32, 160, 64),  (128, 208, 152)),  # green
+        ((32, 160, 128), (120, 208, 184)),  # teal (gripper)
+        # Right arm (cool): joint 1-6, gripper
+        ((32, 144, 160), (120, 200, 216)),  # cyan
+        ((32, 112, 192), (128, 176, 232)),  # azure
+        ((48, 80, 192),  (144, 152, 224)),  # blue
+        ((80, 48, 192),  (168, 144, 224)),  # indigo
+        ((128, 32, 176), (192, 128, 216)),  # purple
+        ((176, 32, 144), (216, 128, 192)),  # magenta
+        ((192, 32, 96),  (224, 128, 152)),  # rose (gripper)
+    ]
+
+    def _init_rerun_styles(self):
+        """Log static SeriesLines styles for all joint signals (called once)."""
+        import rerun as rr
+
+        for i, name in enumerate(ACTION_KEYS):
+            _, light = self._JOINT_COLORS[i]
+            # Leader: light color, thin line
+            rr.log(f"leader/{name}", rr.SeriesLines(
+                colors=[light], widths=[1.0],
+            ), static=True)
+
+        for i, name in enumerate(OBS_STATE_KEYS):
+            # Map obs key to joint index (0-13) via its .pos counterpart
+            base = name.rsplit(".", 1)[0]  # e.g. "left_joint_1"
+            sig = name.rsplit(".", 1)[1]   # "pos", "vel", or "torque"
+            joint_idx = next(
+                (j for j, ak in enumerate(ACTION_KEYS)
+                 if ak.rsplit(".", 1)[0] == base), 0
+            )
+            dark, light = self._JOINT_COLORS[joint_idx]
+            if sig == "pos":
+                # Follower pos: dark color, thick line
+                rr.log(f"follower/{name}", rr.SeriesLines(
+                    colors=[dark], widths=[2.0],
+                ), static=True)
+            else:
+                # Follower vel/torque: light color, normal line
+                rr.log(f"follower/{name}", rr.SeriesLines(
+                    colors=[light], widths=[1.5],
+                ), static=True)
+
+    def init_rerun_styles(self):
+        """Log static SeriesLines styles (call once at startup, not during recording)."""
+        if not self.rerun_enabled:
+            return
+        self._init_rerun_styles()
+        logger.info("Rerun styles initialized (%d obs + %d action series)",
+                     len(OBS_STATE_KEYS), len(ACTION_KEYS))
+
     def _log_rerun(self, obs: dict, obs_state: np.ndarray, action_vec: np.ndarray):
-        """Log current frame to Rerun viewer.
-
-        Layout: follower state under follower/, leader commands under leader/.
-        Follower lines are thick (width=2), leader lines are thin (width=1)
-        with gray color to visually distinguish command vs actual.
-
-        Style (SeriesLines) and data (Scalars) are logged in the SAME call
-        to avoid creating ghost zero-value rows.
-        """
+        """Log current frame to Rerun viewer."""
         try:
             import rerun as rr
 

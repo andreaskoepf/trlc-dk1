@@ -490,6 +490,9 @@ def main():
         rerun_enabled=rerun_enabled,
     )
 
+    # Initialize Rerun styles at startup (not during first frame recording)
+    recorder.init_rerun_styles()
+
     # -- SIGUSR1 thread dump (kill -USR1 <pid> to diagnose hangs) ----------
 
     def _dump_threads(sig, frame):
@@ -540,9 +543,21 @@ def main():
 
     # Try to import Phase 2 modules (may not exist yet)
     try:
-        from lerobot_robot_trlc_dk1.recorder.terminal_ui import TerminalUI
+        from lerobot_robot_trlc_dk1.recorder.terminal_ui import TerminalUI, StatusLineLogHandler
         ui = TerminalUI()
         ui.start()
+        # Replace default log handlers with status-line-aware handler
+        # so log messages don't overwrite the pinned status line.
+        root = logging.getLogger()
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+        handler = StatusLineLogHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(name)s %(levelname)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        handler.setLevel(level)
+        root.addHandler(handler)
     except ImportError:
         ui = None
 
@@ -814,6 +829,8 @@ def _run_event_loop(
                         countdown_beeped.add(2)
                         if audio is not None:
                             audio.countdown_tick(2)
+                        # Pre-open encoder containers + GC during countdown
+                        recorder.prepare_episode(episode_index)
                 elif elapsed < 3.0:
                     count = 1
                     if 1 not in countdown_beeped:
