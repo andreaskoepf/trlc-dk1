@@ -206,7 +206,7 @@ class RecorderThread:
         for enc in self.encoders.values():
             enc.frame_queue.put(PrepareEpisode(episode_index))
 
-        logger.debug("Episode %d: pre-open + GC done", episode_index)
+        logger.info("Episode %d: pre-init (GC + NVENC prime) — brief jitter expected", episode_index)
 
     def begin_episode(self, episode_index: int):
         """Signal encoders and start recording frames."""

@@ -113,6 +113,13 @@ class TerminalUI:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._old_settings = None
+        # Persistent copy of terminal settings for prompt_text (never cleared)
+        self._saved_termios = None
+        try:
+            if sys.stdin.isatty():
+                self._saved_termios = termios.tcgetattr(sys.stdin)
+        except termios.error:
+            pass
 
     def start(self):
         """Start the UI thread (sets terminal to cbreak mode)."""
@@ -129,6 +136,49 @@ class TerminalUI:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+
+    def prompt_text(self, prompt: str, default: str = "") -> str | None:
+        """Temporarily restore terminal for line input. Returns text or None if cancelled.
+
+        Thread-safe: pauses the UI thread's rendering and keyboard polling,
+        restores normal terminal mode, reads a line, then re-enters cbreak.
+        """
+        if self._saved_termios is None:
+            return None
+
+        # Pause the UI render loop
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+        # Restore normal terminal mode for input()
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._saved_termios)
+        except (termios.error, ValueError, OSError):
+            return None
+
+        # Clear status line and show prompt
+        sys.stdout.write(f"\r\033[K  {prompt}")
+        if default:
+            sys.stdout.write(f" [{default}]")
+        sys.stdout.write(": ")
+        sys.stdout.flush()
+
+        try:
+            text = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            text = None
+
+        # Restart UI thread (re-enters cbreak mode)
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="terminal-ui"
+        )
+        self._thread.start()
+
+        if text is None or text == "":
+            return default if default else None
+        return text
 
     def _restore_terminal(self):
         """Restore terminal settings. Safe to call multiple times."""
@@ -211,7 +261,7 @@ class TerminalUI:
             count_str = f"{self.countdown}..." if self.countdown > 0 else "GO!"
             line = (
                 f"  {color}{indicator}{count_str:9s}{self._RESET} | "
-                f"Ep {self.episode} | Esc/Bksp=cancel"
+                f"Ep {self.episode} | Bksp=cancel"
             )
         else:
             line = (
@@ -243,5 +293,8 @@ class TerminalUI:
             self.key_queue.put("space")
         elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
             self.key_queue.put("rerecord")
-        elif ch.lower() == "q" or ch == "\x1b":
+        elif ch.lower() == "q":
             self.key_queue.put("quit")
+        elif ch.lower() == "t":
+            self.key_queue.put("task")
+        # Ignore ESC and escape sequences (cursor keys etc.)

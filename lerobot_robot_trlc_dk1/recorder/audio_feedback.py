@@ -165,4 +165,4 @@ class AudioFeedback:
 
     def recording_done(self):
         self._play_beep("done")
-        self._speak("Recording complete.")
+        self._speak("Shutting down.")
