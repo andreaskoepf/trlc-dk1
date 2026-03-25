@@ -1064,7 +1064,13 @@ def _save_episode(
     try:
         writer.save_episode(episode_index, scalar_frames, video_results)
     except Exception:
-        logger.exception("Failed to save episode %d", episode_index)
+        logger.exception(
+            "FAILED to save episode %d (%d frames LOST). "
+            "Check disk space and permissions: %s",
+            episode_index, len(scalar_frames), writer.dataset_dir,
+        )
+        if audio is not None:
+            audio.error(f"Save failed for episode {episode_index}")
         return
 
     dt_ms = (time.perf_counter() - t0) * 1000

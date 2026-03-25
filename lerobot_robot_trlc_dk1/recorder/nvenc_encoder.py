@@ -102,13 +102,6 @@ class NvencEncoder:
     ``result_queue`` after each episode is finalized.
     """
 
-    # Compute image stats on every Nth frame to avoid GIL saturation.
-    # RunningQuantileStats.update on a 1280x720 image takes ~70ms of
-    # GIL-holding numpy work.  With 3 encoders, every-frame stats would
-    # consume ~200ms of GIL time per 33ms recording period — starving
-    # the teleop, recorder, and UI threads.
-    STATS_EVERY_N_FRAMES = 30  # ~1 stats update per second at 30fps
-
     def __init__(
         self,
         cam_key: str,
@@ -128,6 +121,12 @@ class NvencEncoder:
         self.codec = codec
         self.videos_dir = videos_dir
         self.chunks_size = chunks_size
+        # Image stats on every Nth frame to avoid GIL saturation.
+        # RunningQuantileStats.update on a 1280x720 image takes ~70ms of
+        # GIL-holding numpy work.  With 3 encoders, every-frame stats would
+        # consume ~200ms of GIL time per 33ms recording period — starving
+        # the teleop, recorder, and UI threads.
+        self.stats_every_n_frames = fps  # ~1 stats update per second
 
         self.frame_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self.result_queue: queue.Queue[EncoderResult] = queue.Queue()
@@ -315,7 +314,7 @@ class NvencEncoder:
                     continue
 
             # Stash every Nth frame for deferred stats (only during episode)
-            if recording and episode_frames % self.STATS_EVERY_N_FRAMES == 0:
+            if recording and episode_frames % self.stats_every_n_frames == 0:
                 stats_frames.append(msg.image)
 
             total_frames += 1
