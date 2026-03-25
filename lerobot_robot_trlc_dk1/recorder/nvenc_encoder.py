@@ -40,8 +40,14 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class PrepareEpisode:
+    """Pre-open MP4 container during countdown (before recording starts)."""
+    episode_index: int
+
+
+@dataclass
 class StartEpisode:
-    """Signal the encoder to begin a new episode MP4 file."""
+    """Signal the encoder to begin accepting frames."""
     episode_index: int
 
 
@@ -214,7 +220,7 @@ class NvencEncoder:
     # -- Main loop ----------------------------------------------------------
 
     def _run(self):
-        """Main encoder loop — waits for StartEpisode, encodes until EndEpisode."""
+        """Main encoder loop — handles PrepareEpisode/StartEpisode/EndEpisode lifecycle."""
         logger.info("Encoder thread started: %s (codec=%s)", self.cam_key, self.codec)
         while not self._stop:
             try:
@@ -223,12 +229,21 @@ class NvencEncoder:
                 continue
             if msg is None:
                 break
-            if isinstance(msg, StartEpisode):
-                self._encode_episode(msg.episode_index)
+            if isinstance(msg, PrepareEpisode):
+                # Pre-open container during countdown, then wait for StartEpisode
+                self._encode_episode(msg.episode_index, wait_for_start=True)
+            elif isinstance(msg, StartEpisode):
+                # No PrepareEpisode was sent — open + encode immediately (fallback)
+                self._encode_episode(msg.episode_index, wait_for_start=False)
         logger.info("Encoder thread stopped: %s", self.cam_key)
 
-    def _encode_episode(self, ep_index: int):
-        """Encode frames for one episode into a single MP4."""
+    def _open_container(self, ep_index: int, prime_encoder: bool = False):
+        """Open MP4 container and NVENC stream (expensive, do during countdown).
+
+        If prime_encoder=True, encode and discard a dummy frame to force
+        NVENC lazy initialization (session setup, GPU buffer alloc) so the
+        first real frame encodes without a ~400ms GIL stall.
+        """
         mp4_path = self._episode_path(ep_index)
         mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -239,10 +254,51 @@ class NvencEncoder:
         stream.pix_fmt = "yuv420p"
         stream.options = self.codec_options
 
-        stats = RunningQuantileStats()
-        frame_count = 0
+        pts_offset = 0
+        if prime_encoder:
+            # Force NVENC lazy init by encoding+muxing a dummy black frame.
+            # This frame will be overwritten by the real first frame at pts=0,
+            # so we use pts=0 for the dummy and start real frames at pts=1.
+            dummy = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+            vf = av.VideoFrame.from_ndarray(dummy, format="rgb24")
+            vf.pts = 0
+            for pkt in stream.encode(vf):
+                container.mux(pkt)
+            pts_offset = 1
 
-        logger.debug("Encoder %s: episode %d started → %s", self.cam_key, ep_index, mp4_path)
+        logger.debug("Encoder %s: container pre-opened → %s", self.cam_key, mp4_path)
+        return container, stream, mp4_path, pts_offset
+
+    def _encode_episode(self, ep_index: int, wait_for_start: bool = True):
+        """Encode frames for one episode into a single MP4.
+
+        If wait_for_start=True (PrepareEpisode path), the container is opened
+        and NVENC is primed with a dummy frame during countdown.
+        If wait_for_start=False (direct StartEpisode), encoding starts immediately.
+        """
+        container, stream, mp4_path, pts_offset = self._open_container(
+            ep_index, prime_encoder=wait_for_start,
+        )
+
+        if wait_for_start:
+            # Wait for StartEpisode (container is ready, just waiting for GO)
+            while not self._stop:
+                try:
+                    msg = self.frame_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if msg is None:
+                    container.close()
+                    mp4_path.unlink(missing_ok=True)
+                    return
+                if isinstance(msg, StartEpisode):
+                    break
+                # Ignore other messages while waiting
+
+        frame_count = 0
+        stats_frames: list[np.ndarray] = []
+
+        logger.debug("Encoder %s: episode %d recording", self.cam_key, ep_index)
 
         while True:
             try:
@@ -253,7 +309,6 @@ class NvencEncoder:
                 continue
 
             if msg is None:
-                # Shutdown sentinel
                 break
 
             if isinstance(msg, EndEpisode):
@@ -265,7 +320,7 @@ class NvencEncoder:
             # Encode frame (PyAV releases GIL during NVENC encode)
             try:
                 video_frame = av.VideoFrame.from_ndarray(msg.image, format="rgb24")
-                video_frame.pts = frame_count
+                video_frame.pts = frame_count + pts_offset
                 for packet in stream.encode(video_frame):
                     container.mux(packet)
             except Exception:
@@ -274,20 +329,15 @@ class NvencEncoder:
                         "Encoder %s: first frame encode failed (CUDA/NVENC init error?)",
                         self.cam_key,
                     )
-                    # Don't keep trying — drain remaining messages and bail
                     break
                 else:
                     logger.exception("Encoder %s: encode error at frame %d", self.cam_key, frame_count)
-                    # Skip this frame but keep trying
                     frame_count += 1
                     continue
 
-            # Update per-channel image stats on a subsample of frames.
-            # Full-resolution stats.update() takes ~70ms of GIL time per
-            # 1280x720 image — doing it every frame across 3 encoders
-            # would starve the teleop and recorder threads.
+            # Stash every Nth frame for deferred stats computation.
             if frame_count % self.STATS_EVERY_N_FRAMES == 0:
-                stats.update(msg.image.reshape(-1, 3).astype(np.float32))
+                stats_frames.append(msg.image)
 
             frame_count += 1
 
@@ -296,9 +346,13 @@ class NvencEncoder:
             container.mux(packet)
         container.close()
 
-        # Compute final stats
+        # Compute image stats on deferred frames (outside recording hot path)
         ep_stats: dict[str, np.ndarray] = {}
-        if frame_count >= 2:
+        if stats_frames:
+            stats = RunningQuantileStats()
+            for img in stats_frames:
+                stats.update(img.reshape(-1, 3).astype(np.float32))
+            stats_frames.clear()
             try:
                 ep_stats = stats.get_statistics()
             except ValueError:
