@@ -455,6 +455,17 @@ def cleanup_dataset(dataset_dir: Path):
             meta_changed = True
         meta_dict["dataset_from_index"][i] = global_idx
         meta_dict["dataset_to_index"][i] = global_idx + n_rows
+
+        # Fix video to_timestamp: must match scalar frame count, not MP4 frame count.
+        # The MP4 may contain trailing gesture frames that were trimmed from parquet.
+        fps = info.get("fps", 30)
+        expected_to_ts = n_rows / fps
+        for col in meta_dict:
+            if col.startswith("videos/") and col.endswith("/to_timestamp"):
+                if abs(meta_dict[col][i] - expected_to_ts) > 0.001:
+                    meta_changed = True
+                meta_dict[col][i] = expected_to_ts
+
         global_idx += n_rows
 
     if parquets_fixed:

@@ -51,6 +51,7 @@ def build_features_schema(
     camera_width: int,
     fps: int,
     video_codec: str = "h264",
+    obs_state_keys: list[str] | None = None,
 ) -> dict:
     """Build the ``features`` dict for info.json.
 
@@ -58,6 +59,11 @@ def build_features_schema(
     action → observation.state → video features → metadata columns.
     Key order within features: dtype, names, shape (matching reference).
     """
+    # Default: full 40-element observation
+    if obs_state_keys is None:
+        from lerobot_robot_trlc_dk1.recorder.recorder_thread import _ALL_OBS_STATE_KEYS
+        obs_state_keys = _ALL_OBS_STATE_KEYS
+
     features: dict = {}
 
     # Action FIRST (matching reference dataset order)
@@ -74,26 +80,11 @@ def build_features_schema(
         ("shape", [14]),
     )
 
-    # Observation state SECOND
+    # Observation state SECOND (dynamic based on --obs-signals)
     features["observation.state"] = _ordered_dict(
         ("dtype", "float32"),
-        ("names", [
-            "left_joint_1.pos", "left_joint_1.vel", "left_joint_1.torque",
-            "left_joint_2.pos", "left_joint_2.vel", "left_joint_2.torque",
-            "left_joint_3.pos", "left_joint_3.vel", "left_joint_3.torque",
-            "left_joint_4.pos", "left_joint_4.vel", "left_joint_4.torque",
-            "left_joint_5.pos", "left_joint_5.vel", "left_joint_5.torque",
-            "left_joint_6.pos", "left_joint_6.vel", "left_joint_6.torque",
-            "left_gripper.pos", "left_gripper.torque",
-            "right_joint_1.pos", "right_joint_1.vel", "right_joint_1.torque",
-            "right_joint_2.pos", "right_joint_2.vel", "right_joint_2.torque",
-            "right_joint_3.pos", "right_joint_3.vel", "right_joint_3.torque",
-            "right_joint_4.pos", "right_joint_4.vel", "right_joint_4.torque",
-            "right_joint_5.pos", "right_joint_5.vel", "right_joint_5.torque",
-            "right_joint_6.pos", "right_joint_6.vel", "right_joint_6.torque",
-            "right_gripper.pos", "right_gripper.torque",
-        ]),
-        ("shape", [40]),
+        ("names", list(obs_state_keys)),
+        ("shape", [len(obs_state_keys)]),
     )
 
     # Video features THIRD
@@ -194,7 +185,7 @@ class DatasetWriter:
         Args:
             ep_index: Episode number.
             scalar_frames: List of scalar frame dicts from the recorder thread.
-                Each dict has keys: observation.state (ndarray[40]), action (ndarray[14]),
+                Each dict has keys: observation.state (ndarray), action (ndarray[14]),
                 timestamp (float32), frame_index (int), episode_index (int), task_index (int).
             video_results: cam_key → EncoderResult from encoder threads.
         """
@@ -384,13 +375,16 @@ class DatasetWriter:
         }
 
         # Per-video metadata + stats
+        # to_timestamp uses n_frames (trimmed scalar count), NOT result.frame_count
+        # (full MP4 count) — the MP4 may contain extra trailing gesture frames
+        # that were trimmed from the scalar data.
         for cam_key, result in video_results.items():
             vk = f"observation.images.{cam_key}"
             v_chunk, v_file = self._chunk_file(ep_index)
             row[f"videos/{vk}/chunk_index"] = v_chunk
             row[f"videos/{vk}/file_index"] = v_file
             row[f"videos/{vk}/from_timestamp"] = 0.0
-            row[f"videos/{vk}/to_timestamp"] = result.frame_count / self.fps
+            row[f"videos/{vk}/to_timestamp"] = n_frames / self.fps
 
             for stat_key, stat_val in result.stats.items():
                 row[f"stats/{vk}/{stat_key}"] = stat_val.tolist()

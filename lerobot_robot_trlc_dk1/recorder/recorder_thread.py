@@ -46,7 +46,8 @@ logger = logging.getLogger(__name__)
 # Feature packing constants
 # ---------------------------------------------------------------------------
 
-OBS_STATE_KEYS = [
+# Full observation keys (pos + vel + torque) — 40 elements
+_ALL_OBS_STATE_KEYS = [
     "left_joint_1.pos", "left_joint_1.vel", "left_joint_1.torque",
     "left_joint_2.pos", "left_joint_2.vel", "left_joint_2.torque",
     "left_joint_3.pos", "left_joint_3.vel", "left_joint_3.torque",
@@ -63,6 +64,9 @@ OBS_STATE_KEYS = [
     "right_gripper.pos", "right_gripper.torque",
 ]  # 40 elements
 
+# Default: full signal set
+OBS_STATE_KEYS = _ALL_OBS_STATE_KEYS
+
 ACTION_KEYS = [
     "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
     "left_joint_4.pos", "left_joint_5.pos", "left_joint_6.pos",
@@ -73,8 +77,21 @@ ACTION_KEYS = [
 ]  # 14 elements
 
 
+def build_obs_state_keys(signals: list[str]) -> list[str]:
+    """Build observation state keys filtered by signal types.
+
+    Args:
+        signals: List of signal types to include, e.g. ["pos"], ["pos", "vel"],
+                 or ["pos", "vel", "torque"] (full).
+
+    Returns:
+        Filtered list of observation state keys.
+    """
+    return [k for k in _ALL_OBS_STATE_KEYS if k.rsplit(".", 1)[1] in signals]
+
+
 def pack_observation_state(obs: dict[str, float]) -> np.ndarray:
-    """Pack observation dict into float32[40] vector in documented order."""
+    """Pack observation dict into float32 vector in documented order."""
     return np.array([obs[k] for k in OBS_STATE_KEYS], dtype=np.float32)
 
 
@@ -93,7 +110,7 @@ class RecorderThread:
     The recorder thread runs independently from the teleop thread. It:
     1. Reads observations from the follower (seqlock + cameras)
     2. Snapshots the latest action from the teleop thread
-    3. Packs obs→float32[40] and action→float32[14]
+    3. Packs obs→float32[N] (N depends on --obs-signals) and action→float32[14]
     4. Dispatches camera frames to per-camera encoder queues (non-blocking)
     5. Buffers scalar frames in memory for the dataset writer
 
