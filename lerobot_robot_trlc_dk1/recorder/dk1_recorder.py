@@ -49,14 +49,17 @@ from lerobot_robot_trlc_dk1.recorder.nvenc_encoder import (
     NvencEncoder,
     detect_codec,
 )
-from lerobot_robot_trlc_dk1.recorder.recorder_thread import RecorderThread
+from lerobot_robot_trlc_dk1.recorder.recorder_thread import (
+    RecorderThread,
+    build_obs_state_keys,
+)
 from lerobot_robot_trlc_dk1.recorder.teleop_thread import TeleopThread
 
 logger = logging.getLogger(__name__)
 
 # Camera configuration defaults
-DEFAULT_CAMERA_WIDTH = 1280
-DEFAULT_CAMERA_HEIGHT = 720
+DEFAULT_CAMERA_WIDTH = 640
+DEFAULT_CAMERA_HEIGHT = 360
 DEFAULT_CAMERA_FPS = 60
 CAMERA_KEYS = ["head", "left_wrist", "right_wrist"]
 
@@ -68,6 +71,7 @@ CAMERA_KEYS = ["head", "left_wrist", "right_wrist"]
 class RecorderState:
     IDLE = "idle"
     STARTING = "starting"   # gesture detected, waiting for grippers to open
+    COUNTDOWN = "countdown"  # 3-2-1-GO countdown before recording
     RECORDING = "recording"
     SAVING = "saving"
     WAITING = "waiting"
@@ -199,6 +203,11 @@ def build_argparser() -> argparse.ArgumentParser:
         "--camera-fps", type=int, default=DEFAULT_CAMERA_FPS,
     )
     p.add_argument(
+        "--obs-signals", type=str, default="pos,vel,torque",
+        help="Comma-separated observation signals to record: pos, vel, torque "
+             "(default: pos,vel,torque — full 40-element observation)",
+    )
+    p.add_argument(
         "--visualize", action="store_true",
         help="Enable Rerun visualization (opt-in)",
     )
@@ -260,6 +269,17 @@ def main():
     # For the feature schema, strip encoder suffix (h264_nvenc → h264)
     video_codec = "h264" if "h264" in codec else "hevc"
 
+    # Parse --obs-signals and configure observation keys
+    import lerobot_robot_trlc_dk1.recorder.recorder_thread as _rec_mod
+    obs_signals = [s.strip() for s in args.obs_signals.split(",")]
+    valid_signals = {"pos", "vel", "torque"}
+    if not set(obs_signals).issubset(valid_signals):
+        logger.error("Invalid --obs-signals: %s (valid: pos, vel, torque)", args.obs_signals)
+        sys.exit(1)
+    obs_state_keys = build_obs_state_keys(obs_signals)
+    _rec_mod.OBS_STATE_KEYS = obs_state_keys  # override module-level default
+    logger.info("Observation signals: %s (%d elements)", args.obs_signals, len(obs_state_keys))
+
     # Handle existing dataset
     start_episode, start_frame = handle_existing_dataset(args.dataset_dir, args.resume)
 
@@ -270,6 +290,7 @@ def main():
         camera_width=args.camera_width,
         fps=args.fps,
         video_codec=video_codec,
+        obs_state_keys=obs_state_keys,
     )
 
     # -- Warmup NVENC BEFORE hardware (RT loop's mlockall starves CUDA) ----
@@ -299,6 +320,7 @@ def main():
             camera_width=args.camera_width,
             fps=args.fps,
             video_codec=video_codec,
+            obs_state_keys=obs_state_keys,
         )
 
     # -- Initialize hardware ------------------------------------------------
@@ -400,8 +422,8 @@ def main():
             _right_joints = [f"right_joint_{i}" for i in range(1, 7)] + ["right_gripper"]
 
             def _arm_tabs(joints, side):
-                """Build Pos/Vel/Torque tabs for one arm."""
-                return rrb.Tabs(
+                """Build Pos/Vel/Torque tabs for one arm (respects --obs-signals)."""
+                tabs = [
                     rrb.TimeSeriesView(
                         name=f"{side} Positions",
                         origin="/",
@@ -411,22 +433,25 @@ def main():
                             f"+ leader/{j}.pos" for j in joints
                         ],
                     ),
-                    rrb.TimeSeriesView(
+                ]
+                if "vel" in obs_signals:
+                    tabs.append(rrb.TimeSeriesView(
                         name=f"{side} Velocities",
                         origin="/",
                         contents=[
                             f"+ follower/{j}.vel"
                             for j in joints if "gripper" not in j
                         ],
-                    ),
-                    rrb.TimeSeriesView(
+                    ))
+                if "torque" in obs_signals:
+                    tabs.append(rrb.TimeSeriesView(
                         name=f"{side} Torques",
                         origin="/",
                         contents=[
                             f"+ follower/{j}.torque" for j in joints
                         ],
-                    ),
-                )
+                    ))
+                return rrb.Tabs(*tabs) if len(tabs) > 1 else tabs[0]
 
             blueprint = rrb.Blueprint(
                 rrb.Vertical(
@@ -543,6 +568,7 @@ def main():
   Task:    {args.task}
   Codec:   {next(iter(actual_codecs.values()))}
   Video:   {args.camera_width}x{args.camera_height} @ {args.camera_fps}fps capture, {args.fps}fps recording
+  Obs:     {args.obs_signals} ({len(obs_state_keys)} elements)
   Teleop:  {args.teleop_hz:.0f} Hz
 
   {_B}Keyboard controls:{_N}
@@ -671,6 +697,8 @@ def _run_event_loop(
     _last_heartbeat = time.monotonic()
 
     last_transition_time = 0.0  # time.monotonic() of last state change
+    countdown_start = 0.0       # time.monotonic() when countdown began
+    countdown_beeped: set = set()  # which counts have been beeped
 
     while not shutdown_requested_ref():
         time.sleep(0.05)  # 20 Hz event loop
@@ -692,7 +720,9 @@ def _run_event_loop(
         if not cooldown_active and recorder.gesture_triggered.is_set():
             gesture_triggered = True
             recorder.gesture_triggered.clear()
-            if audio is not None:
+            # Only beep for stop gestures (during recording).
+            # Start gestures get the countdown beeps instead.
+            if audio is not None and state == RecorderState.RECORDING:
                 audio.gesture_detected()
 
         # -- Check if both grippers are open (for STARTING state) -----------
@@ -710,36 +740,102 @@ def _run_event_loop(
 
         if state == RecorderState.IDLE:
             if key_event == "space":
-                # Space = start immediately (no gripper wait)
-                recorder.begin_episode(episode_index)
-                state = RecorderState.RECORDING
+                # Space = start countdown (no gripper wait)
+                countdown_start = time.monotonic()
+                countdown_beeped = set()
+                state = RecorderState.COUNTDOWN
                 last_transition_time = time.monotonic()
                 if audio is not None:
-                    audio.episode_start(episode_index)
-                _print_state(state, episode_index)
+                    audio.countdown_tick(3)
+                countdown_beeped.add(3)
+                if ui is not None:
+                    ui.countdown = 3
+                else:
+                    _print_state(state, episode_index, countdown=3)
             elif gesture_triggered:
                 # Gesture = wait for grippers to open first
                 state = RecorderState.STARTING
                 last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.episode_start(episode_index)
                 logger.info("Start gesture detected — waiting for grippers to open")
-                _print_state(state, episode_index)
+                if ui is None:
+                    _print_state(state, episode_index)
 
         elif state == RecorderState.STARTING:
-            # Wait for both grippers to be fully open before recording
+            # Wait for both grippers to be fully open before countdown
             if grippers_open:
-                recorder.begin_episode(episode_index)
-                state = RecorderState.RECORDING
+                countdown_start = time.monotonic()
+                countdown_beeped = set()
+                state = RecorderState.COUNTDOWN
                 last_transition_time = time.monotonic()
-                logger.info("Grippers open — recording started")
-                _print_state(state, episode_index)
+                if audio is not None:
+                    audio.countdown_tick(3)
+                countdown_beeped.add(3)
+                logger.info("Grippers open — countdown started")
+                if ui is not None:
+                    ui.countdown = 3
+                else:
+                    _print_state(state, episode_index, countdown=3)
             elif key_event == "space":
-                # Space = override, start now regardless of gripper state
-                recorder.begin_episode(episode_index)
-                state = RecorderState.RECORDING
+                # Space = skip gripper wait, go to countdown
+                countdown_start = time.monotonic()
+                countdown_beeped = set()
+                state = RecorderState.COUNTDOWN
                 last_transition_time = time.monotonic()
-                _print_state(state, episode_index)
+                if audio is not None:
+                    audio.countdown_tick(3)
+                countdown_beeped.add(3)
+                if ui is not None:
+                    ui.countdown = 3
+                else:
+                    _print_state(state, episode_index, countdown=3)
+            elif key_event in ("rerecord", "quit"):
+                # Cancel back to idle
+                state = RecorderState.IDLE
+                last_transition_time = time.monotonic()
+                if ui is None:
+                    _print_state(state, episode_index)
+
+        elif state == RecorderState.COUNTDOWN:
+            # 3-2-1-GO countdown (cancelable)
+            if key_event in ("rerecord", "quit"):
+                # Cancel countdown
+                state = RecorderState.IDLE if episode_index == 0 else RecorderState.WAITING
+                last_transition_time = time.monotonic()
+                logger.info("Countdown cancelled")
+                if ui is None:
+                    _print_state(state, episode_index)
+            else:
+                elapsed = time.monotonic() - countdown_start
+                if elapsed < 1.0:
+                    count = 3
+                elif elapsed < 2.0:
+                    count = 2
+                    if 2 not in countdown_beeped:
+                        countdown_beeped.add(2)
+                        if audio is not None:
+                            audio.countdown_tick(2)
+                elif elapsed < 3.0:
+                    count = 1
+                    if 1 not in countdown_beeped:
+                        countdown_beeped.add(1)
+                        if audio is not None:
+                            audio.countdown_tick(1)
+                else:
+                    # GO!
+                    if audio is not None:
+                        audio.countdown_go()
+                    recorder.begin_episode(episode_index)
+                    state = RecorderState.RECORDING
+                    last_transition_time = time.monotonic()
+                    logger.info("Countdown complete — recording started")
+                    if ui is None:
+                        _print_state(state, episode_index)
+
+                # Update UI countdown value (UI thread handles display)
+                if ui is not None and state == RecorderState.COUNTDOWN:
+                    ui.countdown = count
+                elif ui is None and state == RecorderState.COUNTDOWN:
+                    _print_state(state, episode_index, countdown=count)
 
         elif state == RecorderState.RECORDING:
             too_short = recorder.frame_index < MIN_FRAMES_PER_EPISODE
@@ -803,18 +899,19 @@ def _run_event_loop(
 
         elif state == RecorderState.WAITING:
             if key_event == "space":
-                # Space = start immediately
-                recorder.begin_episode(episode_index)
-                state = RecorderState.RECORDING
+                # Space = start countdown
+                countdown_start = time.monotonic()
+                countdown_beeped = set()
+                state = RecorderState.COUNTDOWN
                 last_transition_time = time.monotonic()
                 if audio is not None:
-                    audio.episode_start(episode_index)
+                    audio.countdown_tick(3)
+                countdown_beeped.add(3)
+                _print_state(state, episode_index, countdown=3)
             elif gesture_triggered:
                 # Gesture = wait for grippers to open first
                 state = RecorderState.STARTING
                 last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.episode_start(episode_index)
                 logger.info("Start gesture detected — waiting for grippers to open")
                 _print_state(state, episode_index)
 
@@ -867,8 +964,9 @@ def _save_episode(
         trim_tail_frames: Number of frames to drop from the end of the
             scalar buffer. Used to remove the stop gesture motion from
             the training data. The MP4 files keep the extra frames but
-            the episode metadata (length, to_timestamp) reflects the
-            trimmed count, so training never sees the gesture frames.
+            the episode metadata (length, to_timestamp, parquet data)
+            reflects the trimmed count, so training/visualization never
+            sees the gesture frames.
     """
     t0 = time.perf_counter()
 
@@ -933,9 +1031,14 @@ _D = "\033[2m"          # dim
 _R = "\033[0m"          # reset
 
 
-def _print_state(state: str, episode_index: int):
+def _print_state(state: str, episode_index: int, countdown: int = 0):
     """Simple colored console status (used when terminal_ui is not available)."""
-    if state == RecorderState.RECORDING:
+    if state == RecorderState.COUNTDOWN:
+        if countdown > 0:
+            print(f"\r  {_Y}▸ {countdown}...{_R}  episode {episode_index} (Esc/Bksp=cancel)              ", end="", flush=True)
+        else:
+            print(f"\r  {_G}▸ GO!{_R}  episode {episode_index}                                          ", end="", flush=True)
+    elif state == RecorderState.RECORDING:
         print(f"\r  {_G}● RECORDING{_R} episode {episode_index} (Space=stop, R=re-record, Q=quit)", end="", flush=True)
     elif state == RecorderState.STARTING:
         print(f"\r  {_Y}* OPEN GRIPPERS{_R} to start episode {episode_index} (Space=force start) ", end="", flush=True)

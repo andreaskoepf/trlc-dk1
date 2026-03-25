@@ -57,6 +57,7 @@ class TerminalUI:
         self.teleop_hz: float = 0.0
         self.frame_count: int = 0
         self.encoder_drops: int = 0
+        self.countdown: int = 0  # countdown number (3, 2, 1, 0=GO)
 
         self.key_queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
@@ -128,6 +129,7 @@ class TerminalUI:
     _STATE_COLORS = {
         "idle": _DIM,
         "starting": _YELLOW + _BOLD,
+        "countdown": _YELLOW + _BOLD,
         "recording": _GREEN + _BOLD,
         "saving": _YELLOW,
         "waiting": _YELLOW,
@@ -136,6 +138,7 @@ class TerminalUI:
     _STATE_INDICATORS = {
         "idle": "  ",       # dim dot
         "starting": "* ",   # blinking-ish
+        "countdown": "▸ ",  # countdown arrow
         "recording": "● ",  # solid green dot
         "saving": "~ ",
         "waiting": "○ ",    # hollow dot
@@ -154,12 +157,19 @@ class TerminalUI:
         color = self._STATE_COLORS.get(self.state, "")
         indicator = self._STATE_INDICATORS.get(self.state, "  ")
 
-        line = (
-            f"  {color}{indicator}{self.state:9s}{self._RESET} | "
-            f"Ep {self.episode} | "
-            f"rec:{self.fps_actual:4.0f}Hz teleop:{self.teleop_hz:4.0f}Hz | "
-            f"{time_str}{drop_str}"
-        )
+        if self.state == "countdown":
+            count_str = f"{self.countdown}..." if self.countdown > 0 else "GO!"
+            line = (
+                f"  {color}{indicator}{count_str:9s}{self._RESET} | "
+                f"Ep {self.episode} | Esc/Bksp=cancel"
+            )
+        else:
+            line = (
+                f"  {color}{indicator}{self.state:9s}{self._RESET} | "
+                f"Ep {self.episode} | "
+                f"rec:{self.fps_actual:4.0f}Hz teleop:{self.teleop_hz:4.0f}Hz | "
+                f"{time_str}{drop_str}"
+            )
 
         sys.stdout.write(f"\r{line}\033[K")
         sys.stdout.flush()

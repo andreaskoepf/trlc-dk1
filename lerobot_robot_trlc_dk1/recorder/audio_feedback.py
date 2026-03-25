@@ -41,7 +41,7 @@ class AudioFeedback:
 
     Args:
         enabled: Master enable/disable for all audio.
-        tts_engine: TTS backend — "espeak" (default), "piper", or "none".
+        tts_engine: TTS backend — "espeak" (default, uses spd-say) or "none".
     """
 
     def __init__(self, enabled: bool = True, tts_engine: str = "espeak"):
@@ -49,10 +49,20 @@ class AudioFeedback:
         self.tts_engine = tts_engine
         self._beep_files: dict[str, Path] = {}
 
-        # Check if aplay is available
-        self._has_aplay = shutil.which("aplay") is not None
+        # Prefer pw-play (PipeWire) over aplay (raw ALSA).
+        # On Jetson with HDMI audio, aplay often doesn't route to the
+        # correct sink, while PipeWire respects the desktop audio config.
+        if shutil.which("pw-play") is not None:
+            self._play_cmd = "pw-play"
+        elif shutil.which("aplay") is not None:
+            self._play_cmd = "aplay"
+        else:
+            self._play_cmd = None
+        self._has_aplay = self._play_cmd is not None
         if not self._has_aplay:
-            logger.warning("aplay not found, beep sounds disabled")
+            logger.warning("Neither pw-play nor aplay found, beep sounds disabled")
+        else:
+            logger.info("Audio playback via %s", self._play_cmd)
 
         if enabled and self._has_aplay:
             self._generate_beeps()
@@ -65,6 +75,9 @@ class AudioFeedback:
             ("gesture", 1200, 100),
             ("error", 400, 500),
             ("done", 1000, 300),
+            # Mario Kart-style countdown: 3 low beeps then high "GO!"
+            ("countdown_tick", 523, 250),   # C5 — for 3, 2, 1
+            ("countdown_go", 1047, 400),    # C6 (octave up) — for GO!
         ]
         for name, freq, dur_ms in beep_defs:
             path = Path(f"/tmp/dk1_beep_{name}.wav")
@@ -93,14 +106,14 @@ class AudioFeedback:
 
     def _play_beep(self, name: str):
         """Play a pre-generated beep (non-blocking)."""
-        if not self.enabled or not self._has_aplay:
+        if not self.enabled or self._play_cmd is None:
             return
         path = self._beep_files.get(name)
         if path is None or not path.exists():
             return
         try:
             subprocess.Popen(
-                ["aplay", "-q", str(path)],
+                [self._play_cmd, str(path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -108,19 +121,11 @@ class AudioFeedback:
             pass
 
     def _speak(self, text: str):
-        """Speak text via TTS (non-blocking)."""
+        """Speak text via spd-say (non-blocking)."""
         if not self.enabled or self.tts_engine == "none":
             return
         try:
-            if self.tts_engine == "piper" and shutil.which("piper") is not None:
-                subprocess.Popen(
-                    f'echo "{text}" | piper --model en_US-lessac-medium '
-                    f"--output-raw | aplay -r 22050 -f S16_LE -c 1 -q",
-                    shell=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            elif shutil.which("spd-say") is not None:
+            if shutil.which("spd-say") is not None:
                 subprocess.Popen(
                     ["spd-say", text],
                     stdout=subprocess.DEVNULL,
@@ -149,6 +154,14 @@ class AudioFeedback:
     def episode_discarded(self, episode_num: int):
         self._play_beep("error")
         self._speak(f"Episode {episode_num} discarded")
+
+    def countdown_tick(self, count: int):
+        """Play countdown beep for 3, 2, 1."""
+        self._play_beep("countdown_tick")
+
+    def countdown_go(self):
+        """Play the GO! beep (high octave)."""
+        self._play_beep("countdown_go")
 
     def recording_done(self):
         self._play_beep("done")
