@@ -48,24 +48,31 @@ logger = logging.getLogger(__name__)
 # Feature packing constants
 # ---------------------------------------------------------------------------
 
-# Full observation keys (pos + vel + torque) — 40 elements
-OBS_STATE_KEYS = [
-    "left_joint_1.pos", "left_joint_1.vel", "left_joint_1.torque",
-    "left_joint_2.pos", "left_joint_2.vel", "left_joint_2.torque",
-    "left_joint_3.pos", "left_joint_3.vel", "left_joint_3.torque",
-    "left_joint_4.pos", "left_joint_4.vel", "left_joint_4.torque",
-    "left_joint_5.pos", "left_joint_5.vel", "left_joint_5.torque",
-    "left_joint_6.pos", "left_joint_6.vel", "left_joint_6.torque",
-    "left_gripper.pos", "left_gripper.torque",
-    "right_joint_1.pos", "right_joint_1.vel", "right_joint_1.torque",
-    "right_joint_2.pos", "right_joint_2.vel", "right_joint_2.torque",
-    "right_joint_3.pos", "right_joint_3.vel", "right_joint_3.torque",
-    "right_joint_4.pos", "right_joint_4.vel", "right_joint_4.torque",
-    "right_joint_5.pos", "right_joint_5.vel", "right_joint_5.torque",
-    "right_joint_6.pos", "right_joint_6.vel", "right_joint_6.torque",
-    "right_gripper.pos", "right_gripper.torque",
-]  # 40 elements — always the full signal set internally.
+# Full observation keys grouped by signal type — 40 elements.
+# Layout: 14 pos [0:14] | 12 vel [14:26] | 14 torque [26:40]
+# pos[:14] matches ACTION_KEYS ordering exactly.
 # Filtering for dataset storage happens at the output boundary.
+OBS_STATE_KEYS = [
+    # -- positions (14) -- joints + grippers, same order as ACTION_KEYS
+    "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
+    "left_joint_4.pos", "left_joint_5.pos", "left_joint_6.pos",
+    "left_gripper.pos",
+    "right_joint_1.pos", "right_joint_2.pos", "right_joint_3.pos",
+    "right_joint_4.pos", "right_joint_5.pos", "right_joint_6.pos",
+    "right_gripper.pos",
+    # -- velocities (12) -- joints only (no gripper velocity)
+    "left_joint_1.vel", "left_joint_2.vel", "left_joint_3.vel",
+    "left_joint_4.vel", "left_joint_5.vel", "left_joint_6.vel",
+    "right_joint_1.vel", "right_joint_2.vel", "right_joint_3.vel",
+    "right_joint_4.vel", "right_joint_5.vel", "right_joint_6.vel",
+    # -- torques (14) -- joints + grippers
+    "left_joint_1.torque", "left_joint_2.torque", "left_joint_3.torque",
+    "left_joint_4.torque", "left_joint_5.torque", "left_joint_6.torque",
+    "left_gripper.torque",
+    "right_joint_1.torque", "right_joint_2.torque", "right_joint_3.torque",
+    "right_joint_4.torque", "right_joint_5.torque", "right_joint_6.torque",
+    "right_gripper.torque",
+]  # 40 elements
 
 ACTION_KEYS = [
     "left_joint_1.pos", "left_joint_2.pos", "left_joint_3.pos",
