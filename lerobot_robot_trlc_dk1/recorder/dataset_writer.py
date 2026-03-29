@@ -162,10 +162,39 @@ class DatasetWriter:
         # Aggregate stats across all episodes for stats.json
         self._agg_stats: dict[str, RunningQuantileStats] = {}
 
-        # Accumulated episode metadata rows (rewritten each save)
-        self._episode_rows: list[dict] = []
+        # Accumulated episode metadata rows (rewritten each save).
+        # On resume, load existing rows so they are preserved on next write.
+        self._episode_rows: list[dict] = self._load_existing_episode_rows()
 
         self._init_dataset_dir()
+
+    def _load_existing_episode_rows(self) -> list[dict]:
+        """Load episode metadata rows from an existing parquet file (for resume)."""
+        path = (
+            self.dataset_dir / "meta" / "episodes"
+            / "chunk-000" / "file-000.parquet"
+        )
+        if not path.exists():
+            return []
+        try:
+            table = pq.read_table(path)
+            rows = table.to_pydict()
+            n = table.num_rows
+            if n == 0:
+                return []
+            # Convert columnar dict → list of row dicts
+            keys = list(rows.keys())
+            result = [{k: rows[k][i] for k in keys} for i in range(n)]
+            logger.info(
+                "Loaded %d existing episode metadata rows from %s", n, path
+            )
+            return result
+        except Exception:
+            logger.warning(
+                "Failed to load existing episode metadata from %s", path,
+                exc_info=True,
+            )
+            return []
 
     # -- Initialization -----------------------------------------------------
 
