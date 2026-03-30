@@ -190,10 +190,6 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Port config env file (default: port_config.env)",
     )
     p.add_argument(
-        "--cam-config", type=Path, default=Path("cam_config.env"),
-        help="Camera config env file (default: cam_config.env)",
-    )
-    p.add_argument(
         "--camera-width", type=int, default=DEFAULT_CAMERA_WIDTH,
     )
     p.add_argument(
@@ -257,24 +253,23 @@ def main():
             datefmt="%H:%M:%S",
         )
 
-    # Load port/camera config from env files
-    ports = load_env_config(args.port_config)
-    cams = load_env_config(args.cam_config)
+    # Load port/camera config from env file
+    cfg = load_env_config(args.port_config)
 
-    left_follower_port = ports.get("LEFT_FOLLOWER", os.environ.get("LEFT_FOLLOWER", ""))
-    right_follower_port = ports.get("RIGHT_FOLLOWER", os.environ.get("RIGHT_FOLLOWER", ""))
-    left_leader_port = ports.get("LEFT_LEADER", os.environ.get("LEFT_LEADER", ""))
-    right_leader_port = ports.get("RIGHT_LEADER", os.environ.get("RIGHT_LEADER", ""))
+    left_follower_port = cfg.get("LEFT_FOLLOWER", os.environ.get("LEFT_FOLLOWER", ""))
+    right_follower_port = cfg.get("RIGHT_FOLLOWER", os.environ.get("RIGHT_FOLLOWER", ""))
+    left_leader_port = cfg.get("LEFT_LEADER", os.environ.get("LEFT_LEADER", ""))
+    right_leader_port = cfg.get("RIGHT_LEADER", os.environ.get("RIGHT_LEADER", ""))
 
-    head_cam_path = cams.get("CONTEXT_CAM", os.environ.get("CONTEXT_CAM", ""))
-    left_wrist_path = cams.get("WRIST_LEFT", os.environ.get("WRIST_LEFT", ""))
-    right_wrist_path = cams.get("WRIST_RIGHT", os.environ.get("WRIST_RIGHT", ""))
+    head_cam_path = cfg.get("CONTEXT_CAM", os.environ.get("CONTEXT_CAM", ""))
+    left_wrist_path = cfg.get("WRIST_LEFT", os.environ.get("WRIST_LEFT", ""))
+    right_wrist_path = cfg.get("WRIST_RIGHT", os.environ.get("WRIST_RIGHT", ""))
 
     if not all([left_follower_port, right_follower_port, left_leader_port, right_leader_port]):
         logger.error("Missing port config. Run: python examples/identify_ports.py -m bimanual")
         sys.exit(1)
     if not all([head_cam_path, left_wrist_path, right_wrist_path]):
-        logger.error("Missing camera config. Check cam_config.env")
+        logger.error("Missing camera config. Check port_config.env")
         sys.exit(1)
 
     # Detect codec
