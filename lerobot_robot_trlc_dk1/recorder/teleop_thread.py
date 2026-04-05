@@ -89,7 +89,8 @@ class TeleopThread:
     def auto_home_active(self, value: bool):
         if not value:
             self._auto_home_ramping = False
-            self._auto_home_releasing = False
+            # Don't clear _auto_home_releasing — the release ramp must
+            # continue even after auto_home is deactivated.
         self._auto_home_active = value
 
     def release_auto_home(self):
