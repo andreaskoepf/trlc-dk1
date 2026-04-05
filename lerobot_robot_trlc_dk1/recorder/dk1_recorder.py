@@ -204,6 +204,13 @@ def build_argparser() -> argparse.ArgumentParser:
              "(default: pos,vel,torque — full 40-element observation)",
     )
     p.add_argument(
+        "--auto-home", type=float, nargs="?", const=0.3, default=0.0,
+        metavar="RAD",
+        help="Auto-return to zero home pose between episodes when leader "
+             "joints are within RAD of zero (default threshold: 0.3 rad ≈ 17°, "
+             "0 = disabled). Uses hysteresis to prevent immediate snap.",
+    )
+    p.add_argument(
         "--visualize", action="store_true",
         help="Enable Rerun visualization (opt-in)",
     )
@@ -417,6 +424,7 @@ def main():
         follower=follower,
         leader=leader,
         target_hz=args.teleop_hz,
+        auto_home_threshold=args.auto_home,
     )
 
     # Rerun (opt-in) — init before recorder so it can log frames
@@ -590,6 +598,7 @@ def main():
   Codec:   {next(iter(actual_codecs.values()))}
   Video:   {args.camera_width}x{args.camera_height} @ {args.camera_fps}fps capture, {args.fps}fps recording
   Obs:     {args.obs_signals} ({len(obs_state_keys)} elements)
+  Home:    {"auto @ %.2f rad" % args.auto_home if args.auto_home > 0 else "manual"}
   Teleop:  {args.teleop_hz:.0f} Hz
 
   {_B}Keyboard controls:{_N}
@@ -848,6 +857,9 @@ def _run_event_loop(
                     if audio is not None:
                         audio.countdown_go()
                     recorder.begin_episode(episode_index)
+                    # Reset auto-home: must depart before ramp can activate
+                    teleop._auto_home_departed = False
+                    teleop._auto_home_ramping = False
                     state = RecorderState.RECORDING
                     last_transition_time = time.monotonic()
                     logger.info("Countdown complete — recording started")
@@ -903,6 +915,8 @@ def _run_event_loop(
                     episode_index += 1
                     state = RecorderState.WAITING
                     last_transition_time = time.monotonic()
+                    # Smooth ramp from zero back to leader positions
+                    teleop.release_auto_home()
                     _print_state(state, episode_index)
 
             elif key_event == "rerecord":
@@ -922,6 +936,7 @@ def _run_event_loop(
                     audio.episode_discarded(episode_index)
                 state = RecorderState.WAITING
                 last_transition_time = time.monotonic()
+                teleop.release_auto_home()
                 _print_state(state, episode_index)
 
         elif state == RecorderState.WAITING:
@@ -971,6 +986,10 @@ def _run_event_loop(
                     recorder, encoders, writer, episode_index, audio
                 )
             break
+
+        # -- Auto-home: only active during recording (return-to-home phase).
+        # Between episodes, release_auto_home() handles the smooth ramp back.
+        teleop.auto_home_active = state == RecorderState.RECORDING
 
         # -- Update UI ------------------------------------------------------
         if ui is not None:
