@@ -15,7 +15,7 @@
 """Always-on high-rate teleop thread.
 
 Reads leader arm positions and commands follower arms at ~200 Hz,
-decoupled from the recording rate (30 fps). The latest action is stored
+decoupled from the recording rate (60 fps). The latest action is stored
 for the recorder thread to snapshot via atomic reference read.
 """
 
