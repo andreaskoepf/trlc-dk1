@@ -65,7 +65,7 @@ class RestPoseDetector:
         gripper_open_threshold: float = 0.25,   # grippers must be mostly open
         settle_seconds: float = 1.0,
         min_episode_seconds: float = 3.0,
-        fps: int = 30,
+        fps: int = 60,
     ):
         self.pos_tolerance_rad = pos_tolerance_rad
         self.departure_threshold_rad = departure_threshold_rad

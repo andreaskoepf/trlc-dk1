@@ -131,7 +131,7 @@ class RecorderThread:
         teleop: TeleopThread,
         encoders: dict[str, NvencEncoder],
         camera_keys: list[str],
-        fps: int = 30,
+        fps: int = 60,
         rerun_enabled: bool = False,
         rerun_obs_keys: list[str] | None = None,
     ):
@@ -164,7 +164,7 @@ class RecorderThread:
         except ImportError:
             pass
 
-        # Gesture detection at recording rate (30 Hz, not 20 Hz event loop)
+        # Gesture detection at recording rate (60 Hz, not 20 Hz event loop)
         self.gesture_triggered = threading.Event()
         self.gesture_first_close_frame: int = 0  # frame_index at first close
         self._gesture_left = None
@@ -373,7 +373,7 @@ class RecorderThread:
         if action is None:
             return  # Teleop not started yet
 
-        # 3b. Poll gesture detectors at recording rate (30 Hz)
+        # 3b. Poll gesture detectors at recording rate (60 Hz)
         self._poll_gestures()
 
         # 4. Dispatch camera frames to encoder queues (non-blocking)

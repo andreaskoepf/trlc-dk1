@@ -170,8 +170,8 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Task description string stored in the dataset",
     )
     p.add_argument(
-        "--fps", type=int, default=30,
-        help="Recording frames per second (default: 30)",
+        "--fps", type=int, default=60,
+        help="Recording frames per second (default: 60)",
     )
     p.add_argument(
         "--teleop-hz", type=float, default=250.0,
@@ -179,7 +179,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--codec", type=str, default="h264_nvenc",
-        help="Video codec (default: h264_nvenc, fallback: libx264)",
+        help="Video codec: h264_nvenc, hevc_nvenc, av1_nvenc (default: h264_nvenc, fallback: libx264)",
     )
     p.add_argument(
         "--resume", action="store_true",
@@ -282,7 +282,7 @@ def main():
     # Detect codec
     codec = detect_codec(args.codec)
     # For the feature schema, strip encoder suffix (h264_nvenc → h264)
-    video_codec = "h264" if "h264" in codec else "hevc"
+    video_codec = "h264" if "h264" in codec else "av1" if "av1" in codec else "hevc"
 
     # Parse --obs-signals to determine which signals to store in the dataset.
     # Internally the recorder always captures the full 40-element state vector;
