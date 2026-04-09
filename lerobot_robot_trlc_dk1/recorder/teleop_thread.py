@@ -85,6 +85,19 @@ class TeleopThread:
         """Whether auto-home snapping is currently active."""
         return self._auto_home_active
 
+    @property
+    def auto_home_ramping(self) -> bool:
+        """True while the auto-home ramp-to-zero is in progress (including hold)."""
+        return self._auto_home_ramping
+
+    @property
+    def auto_home_at_rest(self) -> bool:
+        """True when auto-home ramp completed and robot is held at zero."""
+        if not self._auto_home_ramping:
+            return False
+        elapsed = time.perf_counter() - self._auto_home_ramp_start
+        return elapsed >= self._auto_home_ramp_duration
+
     @auto_home_active.setter
     def auto_home_active(self, value: bool):
         if not value:

@@ -897,13 +897,17 @@ def _run_event_loop(
                         )
                         trim = frames_since_first_close + STOP_TRIM_MARGIN
                     elif rest_pose_end:
-                        # Trim the settle period (robot was stationary at rest)
-                        trim = fps  # ~1s settle window
+                        if teleop.auto_home_ramping:
+                            # Auto-home handled the return — no trim needed
+                            trim = 0
+                        else:
+                            # Classic rest-pose settle — trim the idle tail
+                            trim = fps // 2  # ~500ms
                         if audio is not None:
                             audio.gesture_detected()  # audible confirmation
                         logger.info(
-                            "Auto-end: rest pose detected at frame %d",
-                            recorder.frame_index,
+                            "Auto-end: rest pose detected at frame %d (trim=%d)",
+                            recorder.frame_index, trim,
                         )
                     else:
                         trim = 0
