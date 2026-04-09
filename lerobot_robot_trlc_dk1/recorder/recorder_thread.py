@@ -32,6 +32,7 @@ import numpy as np
 
 from lerobot.utils.robot_utils import precise_sleep
 
+from lerobot_robot_trlc_dk1.recorder.auto_home_controller import AutoHomeController
 from lerobot_robot_trlc_dk1.recorder.nvenc_encoder import (
     EndEpisode,
     NvencEncoder,
@@ -83,6 +84,12 @@ ACTION_KEYS = [
     "right_gripper.pos",
 ]  # 14 elements
 
+# Index maps into the 40-element observation state vector.
+# Used by rest pose detector and auto-home settle detection.
+JOINT_POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS)
+                     if ".pos" in k and "gripper" not in k]
+VEL_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS) if ".vel" in k]
+
 
 def build_obs_state_keys(signals: list[str]) -> list[str]:
     """Build observation state keys filtered by signal types.
@@ -117,12 +124,13 @@ class RecorderThread:
     The recorder thread runs independently from the teleop thread. It:
     1. Reads observations from the follower (seqlock + cameras)
     2. Snapshots the latest action from the teleop thread
-    3. Packs obs→float32[40] (full state) and action→float32[14]
+    3. Packs obs->float32[40] (full state) and action->float32[14]
     4. Dispatches camera frames to per-camera encoder queues (non-blocking)
     5. Buffers scalar frames in memory for the dataset writer
 
-    The ``recording`` event controls whether frames are captured. When
-    cleared, the thread idles with minimal CPU usage.
+    Detection hooks (rest pose, auto-home settle, gestures) run at the
+    recording rate (~60 Hz) for timing accuracy, but their logic is
+    delegated to focused detector classes.
     """
 
     def __init__(
@@ -131,6 +139,7 @@ class RecorderThread:
         teleop: TeleopThread,
         encoders: dict[str, NvencEncoder],
         camera_keys: list[str],
+        auto_home: AutoHomeController | None = None,
         fps: int = 60,
         rerun_enabled: bool = False,
         rerun_obs_keys: list[str] | None = None,
@@ -139,6 +148,7 @@ class RecorderThread:
         self.teleop = teleop
         self.encoders = encoders
         self.camera_keys = camera_keys
+        self._auto_home = auto_home
         self.fps = fps
         self.rerun_enabled = rerun_enabled
 
@@ -182,7 +192,6 @@ class RecorderThread:
         self._drop_count: int = 0
         self._rerun_global_frame: int = 0
         self._pre_rolling: bool = False  # cameras rolling before episode start
-        self._auto_home_settle_count: int = 0
 
         # Guards encoder queue puts at episode boundaries so that
         # StartEpisode/EndEpisode cannot interleave with frame dispatches.
@@ -212,35 +221,23 @@ class RecorderThread:
             self._thread.join(timeout=2.0)
         logger.info("Recorder thread stopped")
 
-    # -- Episode control (called from main thread) --------------------------
+    # -- Episode control (called from EpisodeManager) ----------------------
 
     def prepare_episode(self, episode_index: int):
         """Pre-open encoder containers, start cameras rolling, and run GC.
 
         Call during the countdown to move expensive work (av.open,
         NVENC session setup, GC) out of the recording hot path.
-        Cameras start rolling immediately — encoders accept frames
-        from this point. StartEpisode later marks the real episode boundary.
         """
-        # Collect garbage now so it doesn't trigger during recording
         gc.collect()
-
-        # Tell encoders to open containers and start accepting frames
         for enc in self.encoders.values():
             enc.frame_queue.put(PrepareEpisode(episode_index))
-
-        # Start dispatching camera frames to encoders (pre-roll)
         self._pre_rolling = True
-
-        logger.info("Episode %d: pre-init (GC + NVENC) — cameras rolling", episode_index)
+        logger.info("Episode %d: pre-init (GC + NVENC) — cameras rolling",
+                     episode_index)
 
     def begin_episode(self, episode_index: int):
-        """Signal encoders and start recording frames.
-
-        If prepare_episode() was called earlier, encoders are already rolling
-        and this just marks the episode boundary. Otherwise, encoders open
-        containers on the fly (slower, ~500ms NVENC init on first frame).
-        """
+        """Signal encoders and start recording frames."""
         self.episode_index = episode_index
         self.frame_index = 0
         self.episode_buffer = []
@@ -253,27 +250,17 @@ class RecorderThread:
             self._rest_pose_detector.reset()
 
         # Mark episode boundary in encoders (they may already be rolling).
-        # Hold _episode_lock so an in-flight _dispatch_pre_roll() finishes
-        # its queue puts before StartEpisode is enqueued.
         with self._episode_lock:
             self._pre_rolling = False
             for enc in self.encoders.values():
                 enc.frame_queue.put(StartEpisode(episode_index))
 
         self.recording.set()
-        logger.info("Recording started: episode %d", episode_index)
 
     def end_episode(self) -> list[dict]:
-        """Stop recording and return buffered scalar frames.
-
-        Also sends EndEpisode to all encoder queues so they finalize
-        their MP4 files and post results.
-        """
+        """Stop recording and return buffered scalar frames."""
         self.recording.clear()
 
-        # Hold _episode_lock so an in-flight _capture_and_dispatch() finishes
-        # its queue puts + scalar append before EndEpisode is enqueued.
-        # The lock also ensures the buffer snapshot is consistent.
         with self._episode_lock:
             for enc in self.encoders.values():
                 enc.frame_queue.put(EndEpisode())
@@ -295,7 +282,6 @@ class RecorderThread:
         while not self._stop_event.is_set():
             if not self.recording.is_set():
                 if self._pre_rolling:
-                    # Cameras rolling during countdown — dispatch to encoders only
                     self._dispatch_pre_roll()
                 # Idle — still poll gestures at ~30 Hz for start detection
                 self._poll_gestures()
@@ -324,31 +310,25 @@ class RecorderThread:
         """Read one frame of observation + action and dispatch."""
         t_start = time.perf_counter()
 
-        # 1. Read joint state (seqlock — should be ~1µs per arm)
+        # 1. Read joint state (seqlock — should be ~1us per arm)
         t0 = time.perf_counter()
         obs: dict = {}
         try:
             if hasattr(self.follower, 'left_arm'):
-                # BiDK1Follower: read each arm separately
                 left_obs = self.follower.left_arm._get_observation_impedance()
                 obs.update({f"left_{k}": v for k, v in left_obs.items()})
                 right_obs = self.follower.right_arm._get_observation_impedance()
                 obs.update({f"right_{k}": v for k, v in right_obs.items()})
             elif hasattr(self.follower, '_get_observation_impedance'):
-                # Single DK1Follower
                 obs = self.follower._get_observation_impedance()
             else:
-                # Generic fallback (includes cameras — slower)
                 obs = self.follower.get_observation()
-                # Cameras already read, skip step 2
         except Exception:
             logger.exception("Failed to read joint state")
             return
         t_joints = time.perf_counter()
 
         # 2. Read cameras one by one with timing.
-        #    async_read() should timeout after 200ms, but we add an outer
-        #    guard to detect if it hangs longer (GIL starvation, etc).
         for cam_key in self.camera_keys:
             tc0 = time.perf_counter()
             try:
@@ -393,8 +373,6 @@ class RecorderThread:
         timestamp = np.float32(self.frame_index / self.fps)
 
         # 5. Dispatch video + buffer scalar under _episode_lock.
-        # This guarantees EndEpisode (from end_episode) cannot slip between
-        # our VideoFrame puts and the scalar append.
         with self._episode_lock:
             if not self.recording.is_set():
                 return  # episode ended while we were reading cameras
@@ -421,53 +399,9 @@ class RecorderThread:
             })
             self.frame_index += 1
         t_dispatch = time.perf_counter()
-        t_pack = t_dispatch  # packing moved before dispatch
 
-        # 6. Rest pose auto-end detection
-        #    Two modes: when auto-home ramp is complete, check against
-        #    absolute zero (the auto-home target) with tight tolerance
-        #    and short settle (~100ms). Otherwise use the standard detector
-        #    which checks against the captured start pose.
-        if self._rest_pose_detector is not None:
-            if self.frame_index == 1:
-                # Capture rest pose from first frame
-                self._rest_pose_detector.capture_rest_pose(obs_state)
-                self._auto_home_settle_count = 0
-                logger.info(
-                    "Rest pose detector armed (departure_threshold=%.2f rad). "
-                    "Joint pos sample: [%.2f, %.2f, %.2f, ...]",
-                    self._rest_pose_detector.departure_threshold_rad,
-                    obs_state[0], obs_state[3], obs_state[6],
-                )
-            elif self.teleop.auto_home_at_rest:
-                # Auto-home ramp done — check joints against absolute zero
-                from lerobot_robot_trlc_dk1.recorder.rest_pose_detector import (
-                    _JOINT_POS_INDICES, _VEL_INDICES,
-                )
-                pos_err = float(np.max(np.abs(obs_state[_JOINT_POS_INDICES])))
-                max_vel = float(np.max(np.abs(obs_state[_VEL_INDICES])))
-                if pos_err < 0.1 and max_vel < 0.1:
-                    self._auto_home_settle_count += 1
-                else:
-                    self._auto_home_settle_count = 0
-                # ~100ms settle at recording fps
-                if self._auto_home_settle_count >= max(1, self.fps // 10):
-                    logger.info(
-                        "Auto-home settled at frame %d "
-                        "(pos_err=%.3f rad, max_vel=%.3f rad/s, %d frames)",
-                        self.frame_index, pos_err, max_vel,
-                        self._auto_home_settle_count,
-                    )
-                    self.rest_pose_triggered.set()
-            elif self.teleop.auto_home_ramping:
-                # Ramp in progress — suppress standard detector
-                self._rest_pose_detector._settle_count = 0
-                self._auto_home_settle_count = 0
-            else:
-                if self._rest_pose_detector.update(obs_state, self.frame_index):
-                    self.rest_pose_triggered.set()
-        elif self.frame_index == 1:
-            logger.warning("Rest pose detector not available")
+        # 6. Rest pose / auto-home settle detection
+        self._check_rest_pose(obs_state)
         t_rest = time.perf_counter()
 
         # 7. Log to Rerun (if enabled)
@@ -480,28 +414,60 @@ class RecorderThread:
             total_ms = (time.perf_counter() - t_start) * 1000
             logger.debug(
                 "Frame %d: joints=%.1fms cams=%.1fms dispatch=%.1fms "
-                "pack=%.1fms rest=%.1fms rerun=%.1fms total=%.1fms",
+                "rest=%.1fms rerun=%.1fms total=%.1fms",
                 self.frame_index - 1,
                 (t_joints - t0) * 1000,
                 (t_cams - t_joints) * 1000,
                 (t_dispatch - t_cams) * 1000,
-                (t_pack - t_dispatch) * 1000,
-                (t_rest - t_pack) * 1000,
+                (t_rest - t_dispatch) * 1000,
                 (t_rerun - t_rest) * 1000,
                 total_ms,
             )
 
+    def _check_rest_pose(self, obs_state: np.ndarray):
+        """Run rest pose / auto-home settle detection.
+
+        Three modes:
+        1. First frame: capture rest pose reference
+        2. Auto-home at rest: delegate settle check to AutoHomeController
+        3. Auto-home ramping: suppress standard detector
+        4. Normal: use standard RestPoseDetector
+        """
+        if self._rest_pose_detector is not None:
+            if self.frame_index == 1:
+                # Capture rest pose from first frame
+                self._rest_pose_detector.capture_rest_pose(obs_state)
+                if self._auto_home is not None:
+                    self._auto_home.reset_settle()
+                logger.info(
+                    "Rest pose detector armed (departure_threshold=%.2f rad). "
+                    "Joint pos sample: [%.2f, %.2f, %.2f, ...]",
+                    self._rest_pose_detector.departure_threshold_rad,
+                    obs_state[0], obs_state[3], obs_state[6],
+                )
+            elif (self._auto_home is not None
+                  and self._auto_home.at_rest):
+                # Auto-home ramp done — check joints against absolute zero
+                if self._auto_home.check_settle(
+                    obs_state, JOINT_POS_INDICES, VEL_INDICES, self.fps,
+                ):
+                    self.rest_pose_triggered.set()
+            elif (self._auto_home is not None
+                  and self._auto_home.ramping):
+                # Ramp in progress — suppress standard detector
+                self._rest_pose_detector._settle_count = 0
+                self._auto_home.reset_settle()
+            else:
+                if self._rest_pose_detector.update(obs_state, self.frame_index):
+                    self.rest_pose_triggered.set()
+        elif self.frame_index == 1:
+            logger.warning("Rest pose detector not available")
+
     def _dispatch_pre_roll(self):
         """Dispatch camera frames to encoders during pre-roll (countdown).
 
-        Only sends video frames — no scalar data is buffered. This keeps the
-        NVENC pipeline warm so the first real episode frame encodes instantly.
-
-        Camera reads happen outside the lock (they release the GIL and can
-        take ~16ms each). Queue puts happen under _episode_lock so they
-        cannot interleave with StartEpisode from begin_episode().
+        Only sends video frames — no scalar data is buffered.
         """
-        # Read all cameras first (slow, GIL-releasing — no lock needed)
         images: dict[str, np.ndarray] = {}
         for cam_key in self.camera_keys:
             try:
@@ -511,8 +477,6 @@ class RecorderThread:
             except (TimeoutError, Exception):
                 pass
 
-        # Dispatch under lock — if begin_episode() already ran,
-        # _pre_rolling is False and we skip the stale frames.
         with self._episode_lock:
             if not self._pre_rolling:
                 return
@@ -537,19 +501,14 @@ class RecorderThread:
         right_result = self._gesture_right.update(right)
         first_close_time = left_result or right_result
         if first_close_time:
-            # Convert first-close wall time to frame index.
-            # Each frame is 1/fps apart; frame_index is current (about to
-            # be incremented). Estimate how many frames ago the first close
-            # happened based on elapsed time.
             elapsed = time.monotonic() - first_close_time
             frames_ago = int(elapsed * self.fps + 0.5)
             self.gesture_first_close_frame = max(0, self.frame_index - frames_ago)
             self.gesture_triggered.set()
 
+    # -- Rerun logging ------------------------------------------------------
+
     # 14 distinct colors for joints: left arm = warm, right arm = cool.
-    # Each has a dark variant (follower .pos) and light variant (leader .pos,
-    # follower .vel/.torque).
-    #                          dark (R,G,B)      light (R,G,B)
     _JOINT_COLORS: list[tuple[tuple[int,int,int], tuple[int,int,int]]] = [
         # Left arm (warm): joint 1-6, gripper
         ((192, 48, 48),  (232, 144, 144)),  # red
@@ -575,33 +534,29 @@ class RecorderThread:
 
         for i, name in enumerate(ACTION_KEYS):
             _, light = self._JOINT_COLORS[i]
-            # Leader: light color, thin line
             rr.log(f"leader/{name}", rr.SeriesLines(
                 colors=[light], widths=[1.0],
             ), static=True)
 
         for i, name in self._rerun_obs:
-            # Map obs key to joint index (0-13) via its .pos counterpart
-            base = name.rsplit(".", 1)[0]  # e.g. "left_joint_1"
-            sig = name.rsplit(".", 1)[1]   # "pos", "vel", or "torque"
+            base = name.rsplit(".", 1)[0]
+            sig = name.rsplit(".", 1)[1]
             joint_idx = next(
                 (j for j, ak in enumerate(ACTION_KEYS)
                  if ak.rsplit(".", 1)[0] == base), 0
             )
             dark, light = self._JOINT_COLORS[joint_idx]
             if sig == "pos":
-                # Follower pos: dark color, thick line
                 rr.log(f"follower/{name}", rr.SeriesLines(
                     colors=[dark], widths=[2.0],
                 ), static=True)
             else:
-                # Follower vel/torque: light color, normal line
                 rr.log(f"follower/{name}", rr.SeriesLines(
                     colors=[light], widths=[1.5],
                 ), static=True)
 
     def init_rerun_styles(self):
-        """Log static SeriesLines styles (call once at startup, not during recording)."""
+        """Log static SeriesLines styles (call once at startup)."""
         if not self.rerun_enabled:
             return
         self._init_rerun_styles()
@@ -616,17 +571,14 @@ class RecorderThread:
             rr.set_time("frame", sequence=self._rerun_global_frame)
             self._rerun_global_frame += 1
 
-            # Camera images — static=True so only latest frame is kept in memory.
             for cam_key in self.camera_keys:
                 image = obs.get(cam_key)
                 if image is not None:
                     rr.log(f"cameras/{cam_key}", rr.Image(image), static=True)
 
-            # Follower actual state (filtered to --obs-signals)
             for i, name in self._rerun_obs:
                 rr.log(f"follower/{name}", rr.Scalars([obs_state[i]]))
 
-            # Leader commanded positions
             for i, name in enumerate(ACTION_KEYS):
                 rr.log(f"leader/{name}", rr.Scalars([action_vec[i]]))
 

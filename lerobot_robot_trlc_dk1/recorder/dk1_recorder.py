@@ -13,13 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DK1 Recorder — main entry point and state machine orchestrator.
+"""DK1 Recorder — main entry point and RecorderApp orchestrator.
 
 High-performance bimanual teleop recording with:
-- Decoupled teleop (~200 Hz) and recording (configurable fps)
+- Decoupled teleop (~250 Hz) and recording (configurable fps)
 - NVENC streaming H.264 encoding (per-episode MP4)
 - LeRobot v3 compatible dataset output
 - Terminal-first UI with keyboard + gripper gesture controls
+- Table-driven state machine for clean episode flow
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import json
 import logging
 import os
 import queue
+import select
 import signal
 import sys
 import termios
@@ -40,12 +42,13 @@ from lerobot.cameras.opencv.camera_opencv import OpenCVCamera, OpenCVCameraConfi
 
 from lerobot_robot_trlc_dk1.bi_follower import BiDK1Follower, BiDK1FollowerConfig
 from lerobot_robot_trlc_dk1.bi_leader import BiDK1Leader, BiDK1LeaderConfig
+from lerobot_robot_trlc_dk1.recorder.auto_home_controller import AutoHomeController
 from lerobot_robot_trlc_dk1.recorder.dataset_writer import (
     DatasetWriter,
     build_features_schema,
 )
+from lerobot_robot_trlc_dk1.recorder.episode_manager import EpisodeManager
 from lerobot_robot_trlc_dk1.recorder.nvenc_encoder import (
-    EncoderResult,
     NvencEncoder,
     detect_codec,
 )
@@ -53,7 +56,14 @@ from lerobot_robot_trlc_dk1.recorder.recorder_thread import (
     RecorderThread,
     build_obs_state_keys,
 )
+from lerobot_robot_trlc_dk1.recorder.state_machine import (
+    InputEvent,
+    State,
+    StateMachine,
+    build_transition_table,
+)
 from lerobot_robot_trlc_dk1.recorder.teleop_thread import TeleopThread
+from lerobot_robot_trlc_dk1.recorder.trim_policy import StopTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -63,18 +73,380 @@ DEFAULT_CAMERA_HEIGHT = 360
 DEFAULT_CAMERA_FPS = 60
 CAMERA_KEYS = ["head", "left_wrist", "right_wrist"]
 
+# Event loop constants
+GESTURE_COOLDOWN_S = 1.5   # Ignore gesture signals for this long after state changes
+MIN_FRAMES_PER_EPISODE = 10
+GRIPPER_OPEN_THRESHOLD = 0.3
+
 
 # ---------------------------------------------------------------------------
-# State machine
+# RecorderApp — top-level orchestrator
 # ---------------------------------------------------------------------------
 
-class RecorderState:
-    IDLE = "idle"
-    STARTING = "starting"   # gesture detected, waiting for grippers to open
-    COUNTDOWN = "countdown"  # 3-2-1-GO countdown before recording
-    RECORDING = "recording"
-    SAVING = "saving"
-    WAITING = "waiting"
+class RecorderApp:
+    """Top-level orchestrator: owns the event loop and state machine.
+
+    Replaces the previous ``_run_event_loop()`` free function with a
+    clean, table-driven state machine and focused action methods.
+    """
+
+    def __init__(
+        self,
+        recorder: RecorderThread,
+        teleop: TeleopThread,
+        episodes: EpisodeManager,
+        auto_home: AutoHomeController | None,
+        ui,
+        audio,
+        writer: DatasetWriter,
+        fps: int,
+    ):
+        self._sm = StateMachine(State.IDLE, build_transition_table())
+        self._recorder = recorder
+        self._teleop = teleop
+        self._episodes = episodes
+        self._auto_home = auto_home
+        self._ui = ui
+        self._audio = audio
+        self._writer = writer
+        self._fps = fps
+        self._shutdown = False
+        self._signal_count = 0
+
+        # Heartbeat monitoring
+        self._loop_count = 0
+        self._last_heartbeat = time.monotonic()
+
+    @property
+    def shutdown_requested(self) -> bool:
+        return self._shutdown
+
+    def request_shutdown(self):
+        """Request graceful shutdown (called from signal handler)."""
+        self._signal_count += 1
+        self._shutdown = True
+        if self._signal_count >= 3:
+            logger.warning("Forced exit (3rd signal)")
+            os._exit(1)
+        elif self._signal_count >= 2:
+            logger.warning("Second signal received — will force-exit on next")
+
+    def run(self):
+        """Main event loop at ~20 Hz."""
+        while not self._shutdown:
+            time.sleep(0.05)
+
+            for event in self._collect_events():
+                self._handle(event)
+
+            # Auto-home: only active during recording
+            if self._auto_home is not None:
+                self._auto_home.enabled = (self._sm.state == State.RECORDING)
+
+            self._update_ui()
+            self._heartbeat()
+
+        if self._audio is not None:
+            self._audio.recording_done()
+
+    # -- Event collection ---------------------------------------------------
+
+    def _collect_events(self) -> list[InputEvent]:
+        """Poll all input sources, return pending events in priority order."""
+        events: list[InputEvent] = []
+
+        # Keyboard — handle special keys (QUIT, TASK) immediately,
+        # only add state-machine-relevant keys to the events list.
+        key = self._poll_keyboard()
+        if key == InputEvent.QUIT:
+            if self._sm.state == State.RECORDING:
+                self._episodes.end(StopTrigger.QUIT)
+                if self._auto_home is not None:
+                    self._auto_home.release()
+            self._shutdown = True
+            return []
+        elif key == InputEvent.TASK:
+            if self._sm.state in (State.IDLE, State.WAITING):
+                self._handle_task_change()
+        elif key is not None:
+            events.append(key)
+
+        # Gesture (with cooldown)
+        cooldown_active = (
+            time.monotonic() - self._sm.transition_time
+        ) < GESTURE_COOLDOWN_S
+        if not cooldown_active and self._recorder.gesture_triggered.is_set():
+            self._recorder.gesture_triggered.clear()
+            # Beep only for stop gestures (during recording)
+            if self._audio is not None and self._sm.state == State.RECORDING:
+                self._audio.gesture_detected()
+            events.append(InputEvent.GESTURE)
+
+        # Grippers open (only relevant in STARTING state)
+        if self._sm.state == State.STARTING and self._check_grippers_open():
+            events.append(InputEvent.GRIPPERS_OPEN)
+
+        # Rest pose (from recorder thread)
+        if self._recorder.rest_pose_triggered.is_set():
+            self._recorder.rest_pose_triggered.clear()
+            events.append(InputEvent.REST_POSE)
+
+        # Countdown tick (internally generated)
+        if self._sm.state == State.COUNTDOWN:
+            count, should_beep, done = self._episodes.countdown.tick()
+            if done:
+                events.append(InputEvent.COUNTDOWN_DONE)
+            elif should_beep:
+                self._on_countdown_tick(count)
+
+        return events
+
+    def _poll_keyboard(self) -> InputEvent | None:
+        """Poll keyboard input from UI thread or stdin fallback."""
+        if self._ui is not None:
+            try:
+                key_str = self._ui.key_queue.get_nowait()
+            except queue.Empty:
+                return None
+        else:
+            key_str = _poll_stdin_nonblocking()
+            if key_str is None:
+                return None
+
+        # Map key string to InputEvent
+        return {
+            "space": InputEvent.SPACE,
+            "rerecord": InputEvent.RERECORD,
+            "quit": InputEvent.QUIT,
+            "task": InputEvent.TASK,
+        }.get(key_str)
+
+    def _check_grippers_open(self) -> bool:
+        """Check if both grippers are fully open."""
+        action = self._teleop.latest_action
+        if action is None:
+            return False
+        left_grip = action.get("left_gripper.pos", 1.0)
+        right_grip = action.get("right_gripper.pos", 1.0)
+        return (left_grip <= GRIPPER_OPEN_THRESHOLD
+                and right_grip <= GRIPPER_OPEN_THRESHOLD)
+
+    # -- Event dispatch -----------------------------------------------------
+
+    def _handle(self, event: InputEvent):
+        """Dispatch event through state machine, call transition action."""
+        transition = self._sm.transition(event)
+        if transition is not None:
+            method = getattr(self, transition.action)
+            method()
+
+    # -- Transition actions -------------------------------------------------
+
+    def start_countdown(self):
+        """Start 3-2-1-GO countdown (unified — replaces 3 copy-pasted blocks)."""
+        self._episodes.countdown.start()
+        if self._audio is not None:
+            self._audio.countdown_tick(3)
+        if self._ui is not None:
+            self._ui.countdown = 3
+        else:
+            _print_state(State.COUNTDOWN, self._episodes.episode_index, countdown=3)
+
+    def on_start_gesture(self):
+        """Gesture detected — waiting for grippers to open."""
+        logger.info("Start gesture detected — waiting for grippers to open")
+        if self._ui is None:
+            _print_state(State.STARTING, self._episodes.episode_index)
+
+    def on_cancel(self):
+        """Cancel from STARTING state."""
+        if self._ui is None:
+            _print_state(State.IDLE, self._episodes.episode_index)
+
+    def on_cancel_countdown(self):
+        """Cancel countdown — go to IDLE or WAITING depending on context."""
+        self._episodes.countdown.reset()
+        # Dynamic target: IDLE if first episode, WAITING if we've recorded before
+        if self._episodes.episode_index > 0:
+            self._sm.state = State.WAITING
+        logger.info("Countdown cancelled")
+        if self._ui is None:
+            _print_state(self._sm.state, self._episodes.episode_index)
+
+    def begin_recording(self):
+        """Countdown complete — start recording."""
+        if self._audio is not None:
+            self._audio.countdown_go()
+        self._episodes.begin()
+        # Reset auto-home: must depart before ramp can activate
+        if self._auto_home is not None:
+            self._auto_home.reset_departure()
+        logger.info("Countdown complete — recording started")
+        if self._ui is None:
+            _print_state(State.RECORDING, self._episodes.episode_index)
+
+    def end_episode_keyboard(self):
+        """Space pressed during recording — immediate stop, no trim."""
+        self._episodes.end(StopTrigger.KEYBOARD)
+        self._post_episode()
+
+    def end_episode_gesture(self):
+        """Gesture during recording — stop with trim, reject if too short."""
+        if self._recorder.frame_index < MIN_FRAMES_PER_EPISODE:
+            logger.warning(
+                "Episode too short (%d frames < %d), ignoring",
+                self._recorder.frame_index, MIN_FRAMES_PER_EPISODE,
+            )
+            # Reject: revert state to RECORDING
+            self._sm.state = State.RECORDING
+            return
+        self._episodes.end(StopTrigger.GESTURE)
+        self._post_episode()
+
+    def end_episode_rest_pose(self):
+        """Rest pose detected — auto-end with appropriate trim."""
+        if self._recorder.frame_index < MIN_FRAMES_PER_EPISODE:
+            logger.warning(
+                "Episode too short (%d frames < %d), ignoring rest pose",
+                self._recorder.frame_index, MIN_FRAMES_PER_EPISODE,
+            )
+            self._sm.state = State.RECORDING
+            return
+        trigger = (
+            StopTrigger.REST_POSE_AUTO_HOME
+            if self._auto_home is not None and self._auto_home.ramping
+            else StopTrigger.REST_POSE
+        )
+        if self._audio is not None:
+            self._audio.gesture_detected()  # audible confirmation
+        self._episodes.end(trigger)
+        self._post_episode()
+
+    def discard_episode(self):
+        """Discard current episode (re-record)."""
+        self._episodes.discard()
+        self._post_episode()
+
+    def _post_episode(self):
+        """Common post-episode cleanup: release auto-home, update state."""
+        if self._auto_home is not None:
+            self._auto_home.release()
+        self._sm.state = State.WAITING
+        _print_state(State.WAITING, self._episodes.episode_index)
+
+    # -- Countdown ticks ----------------------------------------------------
+
+    def _on_countdown_tick(self, count: int):
+        """Handle countdown tick (beep + pre-roll at T=2)."""
+        if self._audio is not None:
+            self._audio.countdown_tick(count)
+        if count == 2:
+            # Pre-open encoder containers + GC during countdown
+            self._episodes.prepare()
+        if self._ui is not None:
+            self._ui.countdown = count
+        else:
+            _print_state(State.COUNTDOWN, self._episodes.episode_index,
+                         countdown=count)
+
+    # -- Task change --------------------------------------------------------
+
+    def _handle_task_change(self):
+        """Prompt for new task description."""
+        new_task = None
+        if self._ui is not None:
+            new_task = self._ui.prompt_text("New task description",
+                                            self._episodes.task)
+        else:
+            try:
+                sys.stdout.write(
+                    f"\r\033[K  New task [{self._episodes.task}]: ")
+                sys.stdout.flush()
+                text = input().strip()
+                new_task = text if text else self._episodes.task
+            except (EOFError, KeyboardInterrupt):
+                pass
+        if new_task and new_task != self._episodes.task:
+            self._episodes.task = new_task
+
+    # -- UI updates ---------------------------------------------------------
+
+    def _update_ui(self):
+        """Push current state to the terminal UI."""
+        if self._ui is None:
+            return
+        self._ui.state = self._sm.state.value
+        self._ui.episode = self._episodes.episode_index
+        self._ui.fps_actual = self._recorder.actual_fps
+        self._ui.teleop_hz = self._teleop.actual_hz
+        self._ui.frame_count = self._recorder.frame_index
+        self._ui.encoder_drops = self._recorder.drop_count
+
+    def _heartbeat(self):
+        """Log heartbeat during recording to detect stuck main thread."""
+        self._loop_count += 1
+        now = time.monotonic()
+        if (self._sm.state == State.RECORDING
+                and now - self._last_heartbeat > 2.0):
+            logger.warning(
+                "Main loop heartbeat: tick=%d state=%s rec_frames=%d "
+                "rec_fps=%.0f teleop_hz=%.0f",
+                self._loop_count, self._sm.state.value,
+                self._recorder.frame_index,
+                self._recorder.actual_fps, self._teleop.actual_hz,
+            )
+            self._last_heartbeat = now
+
+
+# ---------------------------------------------------------------------------
+# Console output helpers
+# ---------------------------------------------------------------------------
+
+_G = "\033[92m\033[1m"  # green bold
+_Y = "\033[93m\033[1m"  # yellow bold
+_D = "\033[2m"          # dim
+_R = "\033[0m"          # reset
+
+
+def _print_state(state: State, episode_index: int, countdown: int = 0):
+    """Simple colored console status (used when terminal_ui is not available)."""
+    if state == State.COUNTDOWN:
+        if countdown > 0:
+            print(f"\r  {_Y}▸ {countdown}...{_R}  episode {episode_index} (Bksp=cancel)              ", end="", flush=True)
+        else:
+            print(f"\r  {_G}▸ GO!{_R}  episode {episode_index}                                          ", end="", flush=True)
+    elif state == State.RECORDING:
+        print(f"\r  {_G}● RECORDING{_R} episode {episode_index} (Space=stop, R=re-record, Q=quit)", end="", flush=True)
+    elif state == State.STARTING:
+        print(f"\r  {_Y}* OPEN GRIPPERS{_R} to start episode {episode_index} (Space=force start) ", end="", flush=True)
+    elif state == State.WAITING:
+        print(f"\r  {_Y}○ WAITING{_R} for reset (Space=start episode {episode_index}, Q=quit)   ", end="", flush=True)
+    elif state == State.IDLE:
+        print(f"\r  {_D}  IDLE{_R} (Space=start recording)                                       ", end="", flush=True)
+
+
+def _poll_stdin_nonblocking() -> str | None:
+    """Non-blocking stdin read (fallback when terminal_ui is not available)."""
+    try:
+        rlist, _, _ = select.select([sys.stdin], [], [], 0)
+    except (ValueError, OSError):
+        return None
+    if not rlist:
+        return None
+    try:
+        ch = sys.stdin.read(1)
+    except (EOFError, OSError):
+        return None
+    if ch == " ":
+        return "space"
+    elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
+        return "rerecord"
+    elif ch.lower() == "q":
+        return "quit"
+    elif ch.lower() == "t":
+        return "task"
+    # Ignore ESC and escape sequences (cursor keys etc.)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +454,7 @@ class RecorderState:
 # ---------------------------------------------------------------------------
 
 def handle_existing_dataset(dataset_dir: Path, resume: bool) -> tuple[int, int]:
-    """Handle existing dataset directory. Returns (start_episode, start_frame).
-
-    If --resume is set, reads info.json to get current episode/frame counts.
-    Otherwise, prompts the user interactively.
-    """
+    """Handle existing dataset directory. Returns (start_episode, start_frame)."""
     info_path = dataset_dir / "meta" / "info.json"
 
     if not dataset_dir.exists():
@@ -154,7 +522,7 @@ def load_env_config(env_file: Path) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Argument parsing
 # ---------------------------------------------------------------------------
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -221,11 +589,14 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     args = build_argparser().parse_args()
 
     # Save terminal settings BEFORE anything touches the tty.
-    # atexit restores them even if the process crashes or is killed (SIGTERM).
     _saved_termios = None
     if sys.stdin.isatty():
         try:
@@ -281,12 +652,9 @@ def main():
 
     # Detect codec
     codec = detect_codec(args.codec)
-    # For the feature schema, strip encoder suffix (h264_nvenc → h264)
     video_codec = "h264" if "h264" in codec else "av1" if "av1" in codec else "hevc"
 
-    # Parse --obs-signals to determine which signals to store in the dataset.
-    # Internally the recorder always captures the full 40-element state vector;
-    # filtering happens at the output boundary (dataset parquet + Rerun views).
+    # Parse --obs-signals
     obs_signals = [s.strip() for s in args.obs_signals.split(",")]
     valid_signals = {"pos", "vel", "torque"}
     if not set(obs_signals).issubset(valid_signals):
@@ -324,7 +692,6 @@ def main():
         )
         enc.warmup()
         encoders[cam_key] = enc
-    # Update video_codec in case we fell back to libx264
     actual_codecs = {k: e.codec for k, e in encoders.items()}
     logger.info("Encoder codecs: %s", actual_codecs)
     if any("x264" in c for c in actual_codecs.values()):
@@ -368,8 +735,6 @@ def main():
         ),
     }
 
-    # Connect leader arms first (lightweight Dynamixel, fast) to verify
-    # USB serial is healthy before the heavier follower init.
     leader_config = BiDK1LeaderConfig(
         left_arm_port=left_leader_port,
         right_arm_port=right_leader_port,
@@ -379,35 +744,29 @@ def main():
     leader.connect()
     logger.info("Leader arms connected")
 
-    # Connect follower arms WITHOUT cameras — cameras are opened separately
-    # so that a stuck arm serial bus doesn't prevent camera init.
     follower_config = BiDK1FollowerConfig(
         left_arm_port=left_follower_port,
         right_arm_port=right_follower_port,
         control_mode="rt_impedance",
-        cameras={},  # cameras connected separately below
+        cameras={},
     )
     follower = BiDK1Follower(follower_config)
     logger.info("Connecting follower arms (ensure E-Stop is released)...")
     follower.connect()
     logger.info("Follower arms connected")
 
-    # Connect cameras separately
     logger.info("Connecting cameras...")
     cameras = {}
     for cam_key, cam_cfg in camera_configs.items():
-        from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
         cam = OpenCVCamera(cam_cfg)
         cam.connect()
         cameras[cam_key] = cam
         logger.info("  %s connected", cam_key)
-    # Attach cameras to follower so get_observation() includes them
     follower.cameras = cameras
     logger.info("All hardware connected")
 
-    # -- Initialize components (encoders already created above) ---------------
+    # -- Initialize components ---------------------------------------------
 
-    # Dataset writer
     writer = DatasetWriter(
         dataset_dir=args.dataset_dir,
         fps=args.fps,
@@ -419,27 +778,29 @@ def main():
         obs_state_keys=obs_state_keys,
     )
 
-    # Teleop thread
+    # Auto-home controller (shared by teleop + recorder)
+    auto_home = None
+    if args.auto_home > 0:
+        auto_home = AutoHomeController(threshold=args.auto_home)
+
     teleop = TeleopThread(
         follower=follower,
         leader=leader,
         target_hz=args.teleop_hz,
-        auto_home_threshold=args.auto_home,
+        auto_home=auto_home,
     )
 
-    # Rerun (opt-in) — init before recorder so it can log frames
+    # Rerun (opt-in)
     rerun_enabled = args.visualize
     if rerun_enabled:
         try:
             import rerun as rr
             import rerun.blueprint as rrb
 
-            # Build explicit content lists (globs don't work reliably)
             _left_joints = [f"left_joint_{i}" for i in range(1, 7)] + ["left_gripper"]
             _right_joints = [f"right_joint_{i}" for i in range(1, 7)] + ["right_gripper"]
 
             def _arm_tabs(joints, side):
-                """Build Pos/Vel/Torque tabs for one arm (respects --obs-signals)."""
                 tabs = [
                     rrb.TimeSeriesView(
                         name=f"{side} Positions",
@@ -472,18 +833,16 @@ def main():
 
             blueprint = rrb.Blueprint(
                 rrb.Vertical(
-                    # Top row: 3 camera feeds side by side
                     rrb.Horizontal(
                         rrb.Spatial2DView(name="Head", origin="cameras/head"),
                         rrb.Spatial2DView(name="Left Wrist", origin="cameras/left_wrist"),
                         rrb.Spatial2DView(name="Right Wrist", origin="cameras/right_wrist"),
                     ),
-                    # Bottom row: left arm | right arm, each with Pos/Vel/Torque tabs
                     rrb.Horizontal(
                         _arm_tabs(_left_joints, "Left"),
                         _arm_tabs(_right_joints, "Right"),
                     ),
-                    row_shares=[3, 2],  # cameras 60%, plots 40%
+                    row_shares=[3, 2],
                 ),
                 collapse_panels=True,
             )
@@ -497,21 +856,52 @@ def main():
             logger.warning("rerun-sdk not installed, disabling visualization")
             rerun_enabled = False
 
-    # Recorder thread
     recorder = RecorderThread(
         follower=follower,
         teleop=teleop,
         encoders=encoders,
         camera_keys=CAMERA_KEYS,
+        auto_home=auto_home,
         fps=args.fps,
         rerun_enabled=rerun_enabled,
         rerun_obs_keys=obs_state_keys,
     )
-
-    # Initialize Rerun styles at startup (not during first frame recording)
     recorder.init_rerun_styles()
 
-    # -- SIGUSR1 thread dump (kill -USR1 <pid> to diagnose hangs) ----------
+    # Audio feedback
+    audio = None
+    try:
+        from lerobot_robot_trlc_dk1.recorder.audio_feedback import AudioFeedback
+        audio = AudioFeedback()
+    except ImportError:
+        pass
+
+    # Episode manager
+    episodes = EpisodeManager(
+        recorder=recorder,
+        encoders=encoders,
+        writer=writer,
+        audio=audio,
+        fps=args.fps,
+        start_episode=start_episode,
+    )
+
+    # Terminal UI
+    ui = None
+    try:
+        from lerobot_robot_trlc_dk1.recorder.terminal_ui import TerminalUI, StatusLineLogHandler
+        ui = TerminalUI()
+        ui.start()
+        root = logging.getLogger()
+        for h in root.handlers[:]:
+            root.removeHandler(h)
+        handler = StatusLineLogHandler()
+        handler.setLevel(level)
+        root.addHandler(handler)
+    except ImportError:
+        pass
+
+    # -- SIGUSR1 thread dump ------------------------------------------------
 
     def _dump_threads(sig, frame):
         import traceback as _tb
@@ -531,6 +921,23 @@ def main():
 
     signal.signal(signal.SIGUSR1, _dump_threads)
 
+    # -- Build and run app --------------------------------------------------
+
+    app = RecorderApp(
+        recorder=recorder,
+        teleop=teleop,
+        episodes=episodes,
+        auto_home=auto_home,
+        ui=ui,
+        audio=audio,
+        writer=writer,
+        fps=args.fps,
+    )
+
+    # Signal handlers
+    signal.signal(signal.SIGINT, lambda s, f: app.request_shutdown())
+    signal.signal(signal.SIGTERM, lambda s, f: app.request_shutdown())
+
     # -- Start threads ------------------------------------------------------
 
     for enc in encoders.values():
@@ -538,59 +945,9 @@ def main():
     teleop.start()
     recorder.start()
 
-    # -- State machine ------------------------------------------------------
-
-    state = RecorderState.IDLE
-    episode_index = start_episode
-    shutdown_requested = False
-    _signal_count = 0
-
-    def signal_handler(sig, frame):
-        nonlocal shutdown_requested, _signal_count
-        _signal_count += 1
-        shutdown_requested = True
-        if _signal_count >= 3:
-            # Third signal: force-exit immediately (skip cleanup)
-            logger.warning("Forced exit (3rd signal)")
-            os._exit(1)
-        elif _signal_count >= 2:
-            logger.warning("Second signal received — will force-exit on next")
-
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
-    # Try to import Phase 2 modules (may not exist yet)
-    try:
-        from lerobot_robot_trlc_dk1.recorder.terminal_ui import TerminalUI, StatusLineLogHandler
-        ui = TerminalUI()
-        ui.start()
-        # Replace default log handlers with status-line-aware handler
-        # so log messages don't overwrite the pinned status line.
-        root = logging.getLogger()
-        for h in root.handlers[:]:
-            root.removeHandler(h)
-        handler = StatusLineLogHandler()
-        handler.setLevel(level)
-        root.addHandler(handler)
-    except ImportError:
-        ui = None
-
-    try:
-        from lerobot_robot_trlc_dk1.recorder.gesture_detector import GripperGestureDetector
-        gesture_left = GripperGestureDetector()
-        gesture_right = GripperGestureDetector()
-    except ImportError:
-        gesture_left = gesture_right = None
-
-    try:
-        from lerobot_robot_trlc_dk1.recorder.audio_feedback import AudioFeedback
-        audio = AudioFeedback()
-    except ImportError:
-        audio = None
-
-    _B = "\033[1m"  # bold
-    _N = "\033[0m"  # reset
-    _C = "\033[96m" # cyan
+    _B = "\033[1m"
+    _N = "\033[0m"
+    _C = "\033[96m"
     print(f"""
   {_B}DK1 Recorder{_N} — ready
   Dataset: {args.dataset_dir}
@@ -618,39 +975,22 @@ def main():
 """)
 
     try:
-        _run_event_loop(
-            state=state,
-            episode_index=episode_index,
-            recorder=recorder,
-            encoders=encoders,
-            writer=writer,
-            teleop=teleop,
-            ui=ui,
-            audio=audio,
-            gesture_left=gesture_left,
-            gesture_right=gesture_right,
-            rerun_enabled=rerun_enabled,
-            shutdown_requested_ref=lambda: shutdown_requested,
-            fps=args.fps,
-        )
+        app.run()
     finally:
         # -- Cleanup (with timeouts to avoid hangs) -------------------------
         logger.info("Shutting down...")
 
-        # Stop recorder first (stops dispatching to encoder queues)
         try:
             recorder.stop()
         except Exception:
             logger.exception("Error stopping recorder")
 
-        # Stop encoders (sends None sentinel, joins with timeout)
         for enc in encoders.values():
             try:
                 enc.stop()
             except Exception:
                 logger.exception("Error stopping encoder %s", enc.cam_key)
 
-        # Stop teleop (joins with timeout)
         try:
             teleop.stop()
         except Exception:
@@ -668,13 +1008,11 @@ def main():
             except Exception:
                 pass
 
-        # Finalize dataset (write stats.json) — skip if no data
         try:
             writer.finalize()
         except Exception:
             logger.exception("Error finalizing dataset")
 
-        # Disconnect hardware (serial ports, cameras)
         try:
             follower.disconnect()
         except Exception:
@@ -685,466 +1023,6 @@ def main():
             logger.exception("Error disconnecting leader")
 
         logger.info("Done.")
-
-
-# ---------------------------------------------------------------------------
-# Event loop
-# ---------------------------------------------------------------------------
-
-def _run_event_loop(
-    *,
-    state: str,
-    episode_index: int,
-    recorder: RecorderThread,
-    encoders: dict[str, NvencEncoder],
-    writer: DatasetWriter,
-    teleop: TeleopThread,
-    ui,
-    audio,
-    gesture_left,
-    gesture_right,
-    rerun_enabled: bool,
-    shutdown_requested_ref,
-    fps: int,
-):
-    """Main event loop: polls for key events and gesture signals,
-    drives state transitions."""
-
-    # Cooldown: ignore gesture signals for this long after any state transition.
-    # Prevents one gripper's double-close from triggering IDLE→RECORDING and
-    # the other gripper immediately triggering RECORDING→SAVING.
-    GESTURE_COOLDOWN_S = 1.5
-    MIN_FRAMES_PER_EPISODE = 10  # don't save episodes shorter than this
-
-    # Extra margin (in frames) to trim before the first close of the
-    # double-close gesture, so we don't include the start of the grab.
-    STOP_TRIM_MARGIN = int(0.25 * fps)  # 250ms before first close
-
-    # Gripper open threshold for STARTING state (both grippers must be below this)
-    GRIPPER_OPEN_THRESHOLD = 0.3
-
-    _loop_count = 0
-    _last_heartbeat = time.monotonic()
-
-    last_transition_time = 0.0  # time.monotonic() of last state change
-    countdown_start = 0.0       # time.monotonic() when countdown began
-    countdown_beeped: set = set()  # which counts have been beeped
-
-    while not shutdown_requested_ref():
-        time.sleep(0.05)  # 20 Hz event loop
-
-        # -- Poll keyboard (from UI thread or simple stdin) -----------------
-        key_event = None
-        if ui is not None:
-            try:
-                key_event = ui.key_queue.get_nowait()
-            except queue.Empty:
-                pass
-        else:
-            # Fallback: non-blocking stdin read (works without terminal_ui)
-            key_event = _poll_stdin_nonblocking()
-
-        # -- Poll gesture detectors (fed at 30 Hz from recorder thread) ------
-        gesture_triggered = False
-        cooldown_active = (time.monotonic() - last_transition_time) < GESTURE_COOLDOWN_S
-        if not cooldown_active and recorder.gesture_triggered.is_set():
-            gesture_triggered = True
-            recorder.gesture_triggered.clear()
-            # Only beep for stop gestures (during recording).
-            # Start gestures get the countdown beeps instead.
-            if audio is not None and state == RecorderState.RECORDING:
-                audio.gesture_detected()
-
-        # -- Check if both grippers are open (for STARTING state) -----------
-        grippers_open = False
-        action = teleop.latest_action
-        if action is not None:
-            left_grip = action.get("left_gripper.pos", 1.0)
-            right_grip = action.get("right_gripper.pos", 1.0)
-            grippers_open = (
-                left_grip <= GRIPPER_OPEN_THRESHOLD
-                and right_grip <= GRIPPER_OPEN_THRESHOLD
-            )
-
-        # -- State transitions ----------------------------------------------
-
-        if state == RecorderState.IDLE:
-            if key_event == "space":
-                # Space = start countdown (no gripper wait)
-                countdown_start = time.monotonic()
-                countdown_beeped = set()
-                state = RecorderState.COUNTDOWN
-                last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.countdown_tick(3)
-                countdown_beeped.add(3)
-                if ui is not None:
-                    ui.countdown = 3
-                else:
-                    _print_state(state, episode_index, countdown=3)
-            elif gesture_triggered:
-                # Gesture = wait for grippers to open first
-                state = RecorderState.STARTING
-                last_transition_time = time.monotonic()
-                logger.info("Start gesture detected — waiting for grippers to open")
-                if ui is None:
-                    _print_state(state, episode_index)
-
-        elif state == RecorderState.STARTING:
-            # Wait for both grippers to be fully open before countdown
-            if grippers_open:
-                countdown_start = time.monotonic()
-                countdown_beeped = set()
-                state = RecorderState.COUNTDOWN
-                last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.countdown_tick(3)
-                countdown_beeped.add(3)
-                logger.info("Grippers open — countdown started")
-                if ui is not None:
-                    ui.countdown = 3
-                else:
-                    _print_state(state, episode_index, countdown=3)
-            elif key_event == "space":
-                # Space = skip gripper wait, go to countdown
-                countdown_start = time.monotonic()
-                countdown_beeped = set()
-                state = RecorderState.COUNTDOWN
-                last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.countdown_tick(3)
-                countdown_beeped.add(3)
-                if ui is not None:
-                    ui.countdown = 3
-                else:
-                    _print_state(state, episode_index, countdown=3)
-            elif key_event in ("rerecord", "quit"):
-                # Cancel back to idle
-                state = RecorderState.IDLE
-                last_transition_time = time.monotonic()
-                if ui is None:
-                    _print_state(state, episode_index)
-
-        elif state == RecorderState.COUNTDOWN:
-            # 3-2-1-GO countdown (cancelable)
-            if key_event in ("rerecord", "quit"):
-                # Cancel countdown
-                state = RecorderState.IDLE if episode_index == 0 else RecorderState.WAITING
-                last_transition_time = time.monotonic()
-                logger.info("Countdown cancelled")
-                if ui is None:
-                    _print_state(state, episode_index)
-            else:
-                elapsed = time.monotonic() - countdown_start
-                if elapsed < 1.0:
-                    count = 3
-                elif elapsed < 2.0:
-                    count = 2
-                    if 2 not in countdown_beeped:
-                        countdown_beeped.add(2)
-                        if audio is not None:
-                            audio.countdown_tick(2)
-                        # Pre-open encoder containers + GC during countdown
-                        recorder.prepare_episode(episode_index)
-                elif elapsed < 3.0:
-                    count = 1
-                    if 1 not in countdown_beeped:
-                        countdown_beeped.add(1)
-                        if audio is not None:
-                            audio.countdown_tick(1)
-                else:
-                    # GO!
-                    if audio is not None:
-                        audio.countdown_go()
-                    recorder.begin_episode(episode_index)
-                    # Reset auto-home: must depart before ramp can activate
-                    teleop._auto_home_departed = False
-                    teleop._auto_home_ramping = False
-                    state = RecorderState.RECORDING
-                    last_transition_time = time.monotonic()
-                    logger.info("Countdown complete — recording started")
-                    if ui is None:
-                        _print_state(state, episode_index)
-
-                # Update UI countdown value (UI thread handles display)
-                if ui is not None and state == RecorderState.COUNTDOWN:
-                    ui.countdown = count
-                elif ui is None and state == RecorderState.COUNTDOWN:
-                    _print_state(state, episode_index, countdown=count)
-
-        elif state == RecorderState.RECORDING:
-            too_short = recorder.frame_index < MIN_FRAMES_PER_EPISODE
-
-            # Check rest pose auto-end (signaled from recorder thread)
-            rest_pose_end = recorder.rest_pose_triggered.is_set()
-
-            if key_event == "space" or (gesture_triggered and not too_short) or rest_pose_end:
-                # End current episode
-                if too_short and not key_event == "space":
-                    logger.warning(
-                        "Episode too short (%d frames < %d), ignoring",
-                        recorder.frame_index, MIN_FRAMES_PER_EPISODE,
-                    )
-                else:
-                    # Determine trim: gesture-triggered stops trim trailing
-                    # frames to remove the double-close motion from data.
-                    # Rest pose detection already waited for settle, so trim
-                    # just the settle window (those frames are at rest, not task).
-                    if gesture_triggered:
-                        # Trim relative to first close of the double-close gesture
-                        frames_since_first_close = (
-                            recorder.frame_index - recorder.gesture_first_close_frame
-                        )
-                        trim = frames_since_first_close + STOP_TRIM_MARGIN
-                    elif rest_pose_end:
-                        if teleop.auto_home_ramping:
-                            # Auto-home handled the return — no trim needed
-                            trim = 0
-                        else:
-                            # Classic rest-pose settle — trim the idle tail
-                            trim = fps // 2  # ~500ms
-                        if audio is not None:
-                            audio.gesture_detected()  # audible confirmation
-                        logger.info(
-                            "Auto-end: rest pose detected at frame %d (trim=%d)",
-                            recorder.frame_index, trim,
-                        )
-                    else:
-                        trim = 0
-                    state = RecorderState.SAVING
-                    _save_episode(
-                        recorder, encoders, writer, episode_index, audio,
-                        trim_tail_frames=trim,
-                    )
-                    episode_index += 1
-                    state = RecorderState.WAITING
-                    last_transition_time = time.monotonic()
-                    # Smooth ramp from zero back to leader positions
-                    teleop.release_auto_home()
-                    _print_state(state, episode_index)
-
-            elif key_event == "rerecord":
-                # Discard current episode
-                logger.info("Discarding episode %d", episode_index)
-                recorder.end_episode()  # drain buffer, signal encoders
-                # Wait for encoder results and delete orphan MP4 files
-                for enc in encoders.values():
-                    try:
-                        result = enc.result_queue.get(timeout=5.0)
-                        if result.mp4_path and result.mp4_path.exists():
-                            result.mp4_path.unlink()
-                            logger.debug("Deleted orphan %s", result.mp4_path)
-                    except queue.Empty:
-                        pass
-                if audio is not None:
-                    audio.episode_discarded(episode_index)
-                state = RecorderState.WAITING
-                last_transition_time = time.monotonic()
-                teleop.release_auto_home()
-                _print_state(state, episode_index)
-
-        elif state == RecorderState.WAITING:
-            if key_event == "space":
-                # Space = start countdown
-                countdown_start = time.monotonic()
-                countdown_beeped = set()
-                state = RecorderState.COUNTDOWN
-                last_transition_time = time.monotonic()
-                if audio is not None:
-                    audio.countdown_tick(3)
-                countdown_beeped.add(3)
-                _print_state(state, episode_index, countdown=3)
-            elif gesture_triggered:
-                # Gesture = wait for grippers to open first
-                state = RecorderState.STARTING
-                last_transition_time = time.monotonic()
-                logger.info("Start gesture detected — waiting for grippers to open")
-                _print_state(state, episode_index)
-
-        # Change task description (only in IDLE or WAITING)
-        if key_event == "task" and state in (RecorderState.IDLE, RecorderState.WAITING):
-            new_task = None
-            if ui is not None:
-                new_task = ui.prompt_text("New task description", writer.task)
-            else:
-                # Fallback without terminal UI
-                try:
-                    sys.stdout.write(f"\r\033[K  New task [{writer.task}]: ")
-                    sys.stdout.flush()
-                    text = input().strip()
-                    new_task = text if text else writer.task
-                except (EOFError, KeyboardInterrupt):
-                    pass
-            if new_task and new_task != writer.task:
-                writer.task = new_task
-                writer._write_tasks_parquet()
-                writer._write_info_json()
-                logger.info("Task updated: %s", new_task)
-
-        # Quit from any state
-        if key_event == "quit":
-            if state == RecorderState.RECORDING:
-                # Save current episode before quitting
-                state = RecorderState.SAVING
-                _save_episode(
-                    recorder, encoders, writer, episode_index, audio
-                )
-            break
-
-        # -- Auto-home: only active during recording (return-to-home phase).
-        # Between episodes, release_auto_home() handles the smooth ramp back.
-        teleop.auto_home_active = state == RecorderState.RECORDING
-
-        # -- Update UI ------------------------------------------------------
-        if ui is not None:
-            ui.state = state
-            ui.episode = episode_index
-            ui.fps_actual = recorder.actual_fps
-            ui.teleop_hz = teleop.actual_hz
-            ui.frame_count = recorder.frame_index
-            ui.encoder_drops = recorder.drop_count
-
-        # -- Heartbeat (detect main thread stuck) --------------------------
-        _loop_count += 1
-        now = time.monotonic()
-        if state == RecorderState.RECORDING and now - _last_heartbeat > 2.0:
-            logger.warning(
-                "Main loop heartbeat: tick=%d state=%s rec_frames=%d "
-                "rec_fps=%.0f teleop_hz=%.0f",
-                _loop_count, state, recorder.frame_index,
-                recorder.actual_fps, teleop.actual_hz,
-            )
-            _last_heartbeat = now
-
-    if audio is not None:
-        audio.recording_done()
-
-
-def _save_episode(
-    recorder: RecorderThread,
-    encoders: dict[str, NvencEncoder],
-    writer: DatasetWriter,
-    episode_index: int,
-    audio,
-    trim_tail_frames: int = 0,
-):
-    """Handle RECORDING → SAVING → WAITING transition.
-
-    Args:
-        trim_tail_frames: Number of frames to drop from the end of the
-            scalar buffer. Used to remove the stop gesture motion from
-            the training data. The MP4 files keep the extra frames but
-            the episode metadata (length, to_timestamp, parquet data)
-            reflects the trimmed count, so training/visualization never
-            sees the gesture frames.
-    """
-    t0 = time.perf_counter()
-
-    # 1. Stop recorder — returns buffered scalar frames + signals encoders
-    scalar_frames = recorder.end_episode()
-
-    # 2. Trim trailing gesture frames from scalar buffer
-    if trim_tail_frames > 0 and len(scalar_frames) > trim_tail_frames:
-        original_len = len(scalar_frames)
-        scalar_frames = scalar_frames[:-trim_tail_frames]
-        logger.info(
-            "Episode %d: trimmed %d trailing gesture frames (%d → %d)",
-            episode_index, trim_tail_frames, original_len, len(scalar_frames),
-        )
-
-    if not scalar_frames:
-        logger.warning("Episode %d has 0 frames, skipping save", episode_index)
-        # Still need to drain encoder results (they got EndEpisode)
-        for cam_key, encoder in encoders.items():
-            try:
-                encoder.result_queue.get(timeout=3.0)
-            except queue.Empty:
-                pass
-        return
-
-    # 2. Wait for all encoders to finish (blocking, typically 10-50ms)
-    #    Use shorter timeout — if an encoder is wedged, don't block forever.
-    video_results: dict[str, EncoderResult] = {}
-    for cam_key, encoder in encoders.items():
-        try:
-            result = encoder.result_queue.get(timeout=5.0)
-            video_results[cam_key] = result
-        except queue.Empty:
-            logger.warning("Encoder %s timed out for episode %d", cam_key, episode_index)
-            video_results[cam_key] = EncoderResult(
-                episode_index=episode_index,
-                mp4_path=Path(),
-                frame_count=0,
-                stats={},
-            )
-
-    # 3. Write dataset files
-    try:
-        writer.save_episode(episode_index, scalar_frames, video_results)
-    except Exception:
-        logger.exception(
-            "FAILED to save episode %d (%d frames LOST). "
-            "Check disk space and permissions: %s",
-            episode_index, len(scalar_frames), writer.dataset_dir,
-        )
-        if audio is not None:
-            audio.error(f"Save failed for episode {episode_index}")
-        return
-
-    dt_ms = (time.perf_counter() - t0) * 1000
-    logger.info(
-        "Episode %d saved in %.0f ms (%d frames)",
-        episode_index, dt_ms, len(scalar_frames),
-    )
-
-    if audio is not None:
-        audio.episode_end(episode_index)
-
-
-_G = "\033[92m\033[1m"  # green bold
-_Y = "\033[93m\033[1m"  # yellow bold
-_D = "\033[2m"          # dim
-_R = "\033[0m"          # reset
-
-
-def _print_state(state: str, episode_index: int, countdown: int = 0):
-    """Simple colored console status (used when terminal_ui is not available)."""
-    if state == RecorderState.COUNTDOWN:
-        if countdown > 0:
-            print(f"\r  {_Y}▸ {countdown}...{_R}  episode {episode_index} (Bksp=cancel)              ", end="", flush=True)
-        else:
-            print(f"\r  {_G}▸ GO!{_R}  episode {episode_index}                                          ", end="", flush=True)
-    elif state == RecorderState.RECORDING:
-        print(f"\r  {_G}● RECORDING{_R} episode {episode_index} (Space=stop, R=re-record, Q=quit)", end="", flush=True)
-    elif state == RecorderState.STARTING:
-        print(f"\r  {_Y}* OPEN GRIPPERS{_R} to start episode {episode_index} (Space=force start) ", end="", flush=True)
-    elif state == RecorderState.WAITING:
-        print(f"\r  {_Y}○ WAITING{_R} for reset (Space=start episode {episode_index}, Q=quit)   ", end="", flush=True)
-    elif state == RecorderState.IDLE:
-        print(f"\r  {_D}  IDLE{_R} (Space=start recording)                                       ", end="", flush=True)
-
-
-def _poll_stdin_nonblocking() -> str | None:
-    """Non-blocking stdin read (fallback when terminal_ui is not available)."""
-    import select
-    try:
-        rlist, _, _ = select.select([sys.stdin], [], [], 0)
-    except (ValueError, OSError):
-        return None
-    if not rlist:
-        return None
-    try:
-        ch = sys.stdin.read(1)
-    except (EOFError, OSError):
-        return None
-    if ch == " ":
-        return "space"
-    elif ch.lower() == "r" or ch == "\x7f":  # R or Backspace
-        return "rerecord"
-    elif ch.lower() == "q":
-        return "quit"
-    # Ignore ESC and escape sequences (cursor keys etc.)
-    return None
 
 
 if __name__ == "__main__":

@@ -26,15 +26,18 @@ import logging
 
 import numpy as np
 
-from lerobot_robot_trlc_dk1.recorder.recorder_thread import OBS_STATE_KEYS
+from lerobot_robot_trlc_dk1.recorder.recorder_thread import (
+    OBS_STATE_KEYS,
+    JOINT_POS_INDICES,
+    VEL_INDICES,
+)
 
 logger = logging.getLogger(__name__)
 
 # Index maps into the 40-element observation state vector
 _POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS) if ".pos" in k]
-_VEL_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS) if ".vel" in k]
-_JOINT_POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS)
-                      if ".pos" in k and "gripper" not in k]
+_VEL_INDICES = VEL_INDICES
+_JOINT_POS_INDICES = JOINT_POS_INDICES
 _GRIPPER_POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS)
                         if "gripper.pos" in k]
 
