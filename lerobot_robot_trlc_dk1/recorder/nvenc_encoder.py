@@ -25,6 +25,7 @@ import logging
 import queue
 import threading
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 import av
@@ -178,6 +179,7 @@ class NvencEncoder:
             stream.width = self.width
             stream.height = self.height
             stream.pix_fmt = "yuv420p"
+            stream.time_base = Fraction(1, self.fps)
             stream.options = self.codec_options
 
             dummy = np.zeros((self.height, self.width, 3), dtype=np.uint8)
@@ -257,6 +259,9 @@ class NvencEncoder:
         stream.width = self.width
         stream.height = self.height
         stream.pix_fmt = "yuv420p"
+        # Explicit time_base ensures pts=N maps to time N/fps regardless of
+        # codec (h264_nvenc, hevc_nvenc, av1_nvenc all use the same base).
+        stream.time_base = Fraction(1, self.fps)
         stream.options = self.codec_options
 
         total_frames = 0      # all frames in MP4 (pre-roll + episode)

@@ -182,6 +182,12 @@ class RecorderThread:
         self._drop_count: int = 0
         self._rerun_global_frame: int = 0
         self._pre_rolling: bool = False  # cameras rolling before episode start
+        self._auto_home_settle_count: int = 0
+
+        # Guards encoder queue puts at episode boundaries so that
+        # StartEpisode/EndEpisode cannot interleave with frame dispatches.
+        # Only held for fast queue operations, never during camera reads.
+        self._episode_lock = threading.Lock()
 
     @property
     def actual_fps(self) -> float:
@@ -246,10 +252,13 @@ class RecorderThread:
         if self._rest_pose_detector is not None:
             self._rest_pose_detector.reset()
 
-        # Mark episode boundary in encoders (they may already be rolling)
-        self._pre_rolling = False
-        for enc in self.encoders.values():
-            enc.frame_queue.put(StartEpisode(episode_index))
+        # Mark episode boundary in encoders (they may already be rolling).
+        # Hold _episode_lock so an in-flight _dispatch_pre_roll() finishes
+        # its queue puts before StartEpisode is enqueued.
+        with self._episode_lock:
+            self._pre_rolling = False
+            for enc in self.encoders.values():
+                enc.frame_queue.put(StartEpisode(episode_index))
 
         self.recording.set()
         logger.info("Recording started: episode %d", episode_index)
@@ -262,13 +271,15 @@ class RecorderThread:
         """
         self.recording.clear()
 
+        # Hold _episode_lock so an in-flight _capture_and_dispatch() finishes
+        # its queue puts + scalar append before EndEpisode is enqueued.
+        # The lock also ensures the buffer snapshot is consistent.
+        with self._episode_lock:
+            for enc in self.encoders.values():
+                enc.frame_queue.put(EndEpisode())
+            buf = self.episode_buffer
+            self.episode_buffer = []
 
-        # Signal encoders to close current MP4
-        for enc in self.encoders.values():
-            enc.frame_queue.put(EndEpisode())
-
-        buf = self.episode_buffer
-        self.episode_buffer = []
         logger.info(
             "Recording stopped: episode %d, %d frames, %d drops",
             self.episode_index, len(buf), self._drop_count,
@@ -376,52 +387,84 @@ class RecorderThread:
         # 3b. Poll gesture detectors at recording rate (60 Hz)
         self._poll_gestures()
 
-        # 4. Dispatch camera frames to encoder queues (non-blocking)
-        for cam_key in self.camera_keys:
-            image = obs.get(cam_key)
-            if image is None:
-                continue
-            encoder = self.encoders.get(cam_key)
-            if encoder is None:
-                continue
-            try:
-                encoder.frame_queue.put_nowait(
-                    VideoFrame(self.frame_index, image)
-                )
-            except queue.Full:
-                self._drop_count += 1
-        t_dispatch = time.perf_counter()
-
-        # 5. Pack and buffer scalar data
+        # 4. Pack scalar data (outside lock — no shared-state mutation yet)
         obs_state = pack_observation_state(obs)
         action_vec = pack_action(action)
         timestamp = np.float32(self.frame_index / self.fps)
 
-        self.episode_buffer.append({
-            "observation.state": obs_state,
-            "action": action_vec,
-            "timestamp": timestamp,
-            "frame_index": self.frame_index,
-            "episode_index": self.episode_index,
-            "task_index": 0,
-        })
-        self.frame_index += 1
-        t_pack = time.perf_counter()
+        # 5. Dispatch video + buffer scalar under _episode_lock.
+        # This guarantees EndEpisode (from end_episode) cannot slip between
+        # our VideoFrame puts and the scalar append.
+        with self._episode_lock:
+            if not self.recording.is_set():
+                return  # episode ended while we were reading cameras
+            for cam_key in self.camera_keys:
+                image = obs.get(cam_key)
+                if image is None:
+                    continue
+                encoder = self.encoders.get(cam_key)
+                if encoder is None:
+                    continue
+                try:
+                    encoder.frame_queue.put_nowait(
+                        VideoFrame(self.frame_index, image)
+                    )
+                except queue.Full:
+                    self._drop_count += 1
+            self.episode_buffer.append({
+                "observation.state": obs_state,
+                "action": action_vec,
+                "timestamp": timestamp,
+                "frame_index": self.frame_index,
+                "episode_index": self.episode_index,
+                "task_index": 0,
+            })
+            self.frame_index += 1
+        t_dispatch = time.perf_counter()
+        t_pack = t_dispatch  # packing moved before dispatch
 
         # 6. Rest pose auto-end detection
+        #    Two modes: when auto-home ramp is complete, check against
+        #    absolute zero (the auto-home target) with tight tolerance
+        #    and short settle (~100ms). Otherwise use the standard detector
+        #    which checks against the captured start pose.
         if self._rest_pose_detector is not None:
             if self.frame_index == 1:
                 # Capture rest pose from first frame
                 self._rest_pose_detector.capture_rest_pose(obs_state)
+                self._auto_home_settle_count = 0
                 logger.info(
                     "Rest pose detector armed (departure_threshold=%.2f rad). "
                     "Joint pos sample: [%.2f, %.2f, %.2f, ...]",
                     self._rest_pose_detector.departure_threshold_rad,
                     obs_state[0], obs_state[3], obs_state[6],
                 )
+            elif self.teleop.auto_home_at_rest:
+                # Auto-home ramp done — check joints against absolute zero
+                from lerobot_robot_trlc_dk1.recorder.rest_pose_detector import (
+                    _JOINT_POS_INDICES, _VEL_INDICES,
+                )
+                pos_err = float(np.max(np.abs(obs_state[_JOINT_POS_INDICES])))
+                max_vel = float(np.max(np.abs(obs_state[_VEL_INDICES])))
+                if pos_err < 0.1 and max_vel < 0.1:
+                    self._auto_home_settle_count += 1
+                else:
+                    self._auto_home_settle_count = 0
+                # ~100ms settle at recording fps
+                if self._auto_home_settle_count >= max(1, self.fps // 10):
+                    logger.info(
+                        "Auto-home settled at frame %d "
+                        "(pos_err=%.3f rad, max_vel=%.3f rad/s, %d frames)",
+                        self.frame_index, pos_err, max_vel,
+                        self._auto_home_settle_count,
+                    )
+                    self.rest_pose_triggered.set()
+            elif self.teleop.auto_home_ramping:
+                # Ramp in progress — suppress standard detector
+                self._rest_pose_detector._settle_count = 0
+                self._auto_home_settle_count = 0
             else:
                 if self._rest_pose_detector.update(obs_state, self.frame_index):
-                    # Signal main thread that rest pose was detected
                     self.rest_pose_triggered.set()
         elif self.frame_index == 1:
             logger.warning("Rest pose detector not available")
@@ -453,20 +496,33 @@ class RecorderThread:
 
         Only sends video frames — no scalar data is buffered. This keeps the
         NVENC pipeline warm so the first real episode frame encodes instantly.
+
+        Camera reads happen outside the lock (they release the GIL and can
+        take ~16ms each). Queue puts happen under _episode_lock so they
+        cannot interleave with StartEpisode from begin_episode().
         """
+        # Read all cameras first (slow, GIL-releasing — no lock needed)
+        images: dict[str, np.ndarray] = {}
         for cam_key in self.camera_keys:
             try:
                 cam = self.follower.cameras.get(cam_key)
-                if cam is None:
-                    continue
-                image = cam.async_read()
+                if cam is not None:
+                    images[cam_key] = cam.async_read()
+            except (TimeoutError, Exception):
+                pass
+
+        # Dispatch under lock — if begin_episode() already ran,
+        # _pre_rolling is False and we skip the stale frames.
+        with self._episode_lock:
+            if not self._pre_rolling:
+                return
+            for cam_key, image in images.items():
                 encoder = self.encoders.get(cam_key)
                 if encoder is not None:
-                    encoder.frame_queue.put_nowait(VideoFrame(0, image))
-            except (TimeoutError, queue.Full):
-                pass
-            except Exception:
-                pass
+                    try:
+                        encoder.frame_queue.put_nowait(VideoFrame(0, image))
+                    except queue.Full:
+                        pass
 
     def _poll_gestures(self):
         """Check gripper gesture detectors using latest teleop action."""
