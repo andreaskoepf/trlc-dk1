@@ -132,18 +132,24 @@ class NvencEncoder:
         self.frame_queue: queue.Queue = queue.Queue(maxsize=queue_maxsize)
         self.result_queue: queue.Queue[EncoderResult] = queue.Queue()
 
-        # Build codec options
+        # GOP=fps//2 (~2 keyframes/s) for fast random seeking during training;
+        # low-latency tunes must be avoided as they force an infinite GOP.
+        gop = max(1, fps // 2)
         self.codec_options: dict[str, str] = {}
         if "nvenc" in codec:
             self.codec_options = {
                 "preset": "p4",
-                "tune": "ull",
+                "tune": "hq",
+                "g": str(gop),
                 "max_b_frames": "0",
             }
         elif codec == "libx264":
             self.codec_options = {
-                "preset": "ultrafast",
-                "tune": "zerolatency",
+                "preset": "veryfast",
+                "g": str(gop),
+                "keyint_min": str(gop),
+                "sc_threshold": "0",
+                "max_b_frames": "0",
             }
 
         self._thread: threading.Thread | None = None
@@ -200,7 +206,14 @@ class NvencEncoder:
             )
             test_path.unlink(missing_ok=True)
             self.codec = "libx264"
-            self.codec_options = {"preset": "ultrafast", "tune": "zerolatency"}
+            gop = max(1, self.fps // 2)
+            self.codec_options = {
+                "preset": "veryfast",
+                "g": str(gop),
+                "keyint_min": str(gop),
+                "sc_threshold": "0",
+                "max_b_frames": "0",
+            }
             return False
 
     def start(self):
