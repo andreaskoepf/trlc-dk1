@@ -26,6 +26,7 @@ dk1_recorder.py, and inline trim decisions in the event loop.
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import time
 from pathlib import Path
@@ -54,9 +55,14 @@ class CountdownTimer:
         return self._start_time > 0.0
 
     def start(self):
-        """Start the countdown."""
+        """Start the countdown.
+
+        Pre-marks the initial count (``ceil(duration)``) as already beeped:
+        ``RecorderApp.start_countdown`` plays that entry beep itself, so
+        the first tick must not replay it.
+        """
         self._start_time = time.monotonic()
-        self._beeped = set()
+        self._beeped = {math.ceil(self._duration)}
 
     def reset(self):
         """Reset to inactive state."""
@@ -74,9 +80,13 @@ class CountdownTimer:
         """
         elapsed = time.monotonic() - self._start_time
         if elapsed >= self._duration:
-            return 0, 0 not in self._beeped, True
+            return 0, False, True
 
-        count = int(self._duration - elapsed)  # 3 → 2 → 1
+        # ceil so each count is held for a full second (3 for [0,1), 2 for
+        # [1,2), 1 for [2,3)). Using int() here would jump to count-1 the
+        # moment elapsed exceeded zero, fire an extra beep at count=0, and
+        # advance prepare_episode by ~1 s.
+        count = math.ceil(self._duration - elapsed)
         should_beep = count not in self._beeped
         if should_beep:
             self._beeped.add(count)

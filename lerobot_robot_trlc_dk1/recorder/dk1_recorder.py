@@ -186,8 +186,14 @@ class RecorderApp:
         if self._sm.state == State.STARTING and self._check_grippers_open():
             events.append(InputEvent.GRIPPERS_OPEN)
 
-        # Rest pose (from recorder thread)
-        if self._recorder.rest_pose_triggered.is_set():
+        # Rest pose (from recorder thread). Gate on MIN_FRAMES_PER_EPISODE
+        # so we don't consume-and-drop the flag during the first ~10 frames
+        # — the auto-home settle path can fire arbitrarily early, and the
+        # recorder thread will keep re-setting the flag as long as the
+        # settle conditions hold.
+        if (self._recorder.rest_pose_triggered.is_set()
+                and self._sm.state == State.RECORDING
+                and self._recorder.frame_index >= MIN_FRAMES_PER_EPISODE):
             self._recorder.rest_pose_triggered.clear()
             events.append(InputEvent.REST_POSE)
 
@@ -304,14 +310,11 @@ class RecorderApp:
         self._post_episode()
 
     def end_episode_rest_pose(self):
-        """Rest pose detected — auto-end with appropriate trim."""
-        if self._recorder.frame_index < MIN_FRAMES_PER_EPISODE:
-            logger.warning(
-                "Episode too short (%d frames < %d), ignoring rest pose",
-                self._recorder.frame_index, MIN_FRAMES_PER_EPISODE,
-            )
-            self._sm.state = State.RECORDING
-            return
+        """Rest pose detected — auto-end with appropriate trim.
+
+        ``_collect_events`` gates this on ``frame_index >=
+        MIN_FRAMES_PER_EPISODE``, so a too-short episode cannot reach here.
+        """
         trigger = (
             StopTrigger.REST_POSE_AUTO_HOME
             if self._auto_home is not None and self._auto_home.ramping
