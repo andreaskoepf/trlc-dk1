@@ -122,9 +122,12 @@ class RestPoseDetector:
                     frame_index, max_pos_error, self.departure_threshold_rad,
                 )
             else:
-                # Log periodically so we can see values are updating
+                # Diagnostic heartbeat — debug-only so a normal episode
+                # doesn't print multiple lines per second. Visible with
+                # `logging.getLogger("lerobot_robot_trlc_dk1.recorder."
+                # "rest_pose_detector").setLevel(logging.DEBUG)`.
                 if frame_index % 100 == 0:
-                    logger.info(
+                    logger.debug(
                         "Rest pose: waiting for departure at frame %d "
                         "(max_error=%.3f rad, need > %.2f)",
                         frame_index, max_pos_error, self.departure_threshold_rad,
@@ -147,11 +150,15 @@ class RestPoseDetector:
         velocities = obs_state[_VEL_INDICES]
         vel_ok = np.all(np.abs(velocities) < self.vel_tolerance_rad_s)
 
-        # Log which conditions are failing (every 100 frames after departure)
+        # Per-condition diagnostic heartbeat — debug-only. The state
+        # transitions that follow (settling started / rest pose
+        # detected) still log at INFO, so a normal episode only shows
+        # the signal, not the noise. Re-enable via
+        # `.setLevel(logging.DEBUG)` on this logger when tuning caps.
         if frame_index % 100 == 0:
             worst_joint_idx = int(np.argmax(pos_error))
             worst_joint = [k for k in OBS_STATE_KEYS if ".pos" in k and "gripper" not in k][worst_joint_idx]
-            logger.info(
+            logger.debug(
                 "Rest pose check frame %d: pos=%s(%.3f/%s) grip=%s(%.2f,%.2f) vel=%s(%.3f) | %s",
                 frame_index,
                 "OK" if pos_ok else "FAIL", float(np.max(pos_error)), worst_joint,
