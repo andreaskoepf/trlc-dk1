@@ -172,6 +172,14 @@ def encode_one(
     tmp_out = target_mp4.with_name(target_mp4.stem + ".partial.mp4")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        # `-nostdin` tells ffmpeg not to read/manipulate the terminal.
+        # Without it (and without stdin=DEVNULL below), ffmpeg puts the
+        # parent's TTY into non-canonical no-echo mode so it can receive
+        # its interactive hotkeys ('q' = quit, etc.). With --parallel N,
+        # N ffmpegs contend over the same stdin and even clean exits
+        # can leave the terminal's echo bit off — which then persists
+        # in the user's shell after this script returns.
+        "-nostdin",
         "-threads", str(threads),
         "-framerate", str(fps),
         "-i", str(ep_dir / "frame_%06d.jpg"),
@@ -183,8 +191,13 @@ def encode_one(
     try:
         # Capture stderr so real errors (bad JPEG, codec failure,
         # disk-full) surface in our output — ffmpeg sends diagnostics
-        # to stderr, and a silent non-zero exit is unhelpful.
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # to stderr, and a silent non-zero exit is unhelpful. Also pin
+        # stdin to /dev/null (belt-and-suspenders with `-nostdin`) so
+        # the subprocess has zero access to the terminal fd.
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL,
+        )
         if result.returncode != 0:
             if tmp_out.exists():
                 tmp_out.unlink()
