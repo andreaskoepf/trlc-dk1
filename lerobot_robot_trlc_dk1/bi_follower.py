@@ -26,7 +26,6 @@ from lerobot_robot_trlc_dk1.motors.DM_Control_Python.DM_CAN import *
 from lerobot_robot_trlc_dk1.follower import DK1Follower, DK1FollowerConfig
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 def map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
