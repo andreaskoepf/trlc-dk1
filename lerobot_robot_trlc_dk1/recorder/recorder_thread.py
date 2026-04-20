@@ -232,7 +232,12 @@ class RecorderThread:
         # Start dispatching camera frames to encoders (pre-roll)
         self._pre_rolling = True
 
-        logger.info("Episode %d: pre-init (GC + NVENC) — cameras rolling", episode_index)
+        # Identify encoder types so the log is honest — NVENC-specific
+        # message was misleading in e.g. jpeg_offline mode.
+        enc_kinds = sorted({type(e).__name__ for e in self.encoders.values()})
+        enc_desc = "+".join(enc_kinds) if enc_kinds else "none"
+        logger.info("Episode %d: pre-init (GC + %s) — cameras rolling",
+                    episode_index, enc_desc)
 
     def begin_episode(self, episode_index: int):
         """Signal encoders and start recording frames.

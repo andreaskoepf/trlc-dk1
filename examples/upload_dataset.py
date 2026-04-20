@@ -316,6 +316,84 @@ def _reorder_info_features(dataset_dir: Path):
     return False
 
 
+def _mp4_frame_count(path: Path) -> int | None:
+    """Return the packet count of the first video stream in `path`, or None
+    if ffprobe fails or the file is missing.
+
+    Used by `_verify_video_frame_counts` as the authoritative video length
+    — `nb_read_packets` counts every packet that ffmpeg decodes without
+    needing to actually decode, so it's fast even for long episodes.
+    """
+    import subprocess
+    if not path.exists():
+        return None
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True).stdout.strip()
+        return int(out) if out else None
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return None
+
+
+def _verify_video_frame_counts(dataset_dir: Path, meta_dict: dict,
+                                chunks_size: int) -> list[str]:
+    """Sanity-check that every camera's MP4 covers its episode's
+    parquet length.
+
+    LeRobot's dataloader slices videos by timestamp derived from the
+    parquet row count. If an MP4 has FEWER frames than the parquet has
+    rows (e.g. frame drops during recording left the video short while
+    scalar rows kept being appended), the dataloader will read past the
+    MP4's EOF on later frames and return garbage — which is why the
+    plain `to_timestamp = n_rows/fps` fix is not enough. We bail out
+    here so the bad dataset never reaches training or the Hub.
+
+    Returns a list of human-readable problem descriptions (empty =
+    all episodes pass). Also tolerates MP4s slightly LONGER than
+    parquet (trailing gesture frames, pre-roll tail) — those are
+    already handled correctly by the to_timestamp fix.
+    """
+    problems: list[str] = []
+    # Camera keys are inferred from videos/<key>/ subdirs, not hard-coded,
+    # so this works for any camera layout.
+    video_root = dataset_dir / "videos"
+    if not video_root.exists():
+        return problems
+    video_keys = sorted(d.name for d in video_root.iterdir()
+                        if d.is_dir() and d.name.startswith("observation.images."))
+    if not video_keys:
+        return problems
+
+    n_eps = len(meta_dict.get("episode_index", []))
+    for i in range(n_eps):
+        ep_idx = meta_dict["episode_index"][i]
+        n_rows = (meta_dict["dataset_to_index"][i]
+                  - meta_dict["dataset_from_index"][i])
+        chunk = ep_idx // chunks_size
+        file_idx = ep_idx % chunks_size
+        for vk in video_keys:
+            mp4 = (video_root / vk / f"chunk-{chunk:03d}"
+                   / f"file-{file_idx:03d}.mp4")
+            n_video = _mp4_frame_count(mp4)
+            if n_video is None:
+                problems.append(
+                    f"episode {ep_idx}: {vk} video missing or unreadable "
+                    f"({mp4})")
+                continue
+            if n_video < n_rows:
+                problems.append(
+                    f"episode {ep_idx}: {vk} has {n_video} video frames "
+                    f"but parquet has {n_rows} rows "
+                    f"(short by {n_rows - n_video} frames / "
+                    f"{(n_rows - n_video) / 60:.1f}s @60fps) — dataloader "
+                    f"will read past EOF. Drop the episode via "
+                    f"examples/delete_episode.py or re-record.")
+    return problems
+
+
 def cleanup_dataset(dataset_dir: Path):
     """Remove orphan files, re-index episodes contiguously, fix global index.
 
@@ -505,6 +583,24 @@ def cleanup_dataset(dataset_dir: Path):
     else:
         print(f"  Done: {n} episodes, {global_idx} frames")
 
+    # Verify every camera's MP4 has at least as many frames as its
+    # episode's parquet. Runs AFTER the to_timestamp fix above because
+    # an episode with a short video would otherwise look fine in the
+    # metadata but blow up at training time.
+    print("  Verifying video frame counts match parquet row counts ...")
+    video_problems = _verify_video_frame_counts(
+        dataset_dir, meta_dict, chunks_size)
+    if video_problems:
+        print(f"  [!] Found {len(video_problems)} video/parquet mismatch(es):")
+        for p in video_problems:
+            print(f"      {p}")
+        # Attach so callers (main()) can refuse to upload without
+        # re-running ffprobe on every episode.
+        cleanup_dataset._last_video_problems = video_problems
+    else:
+        cleanup_dataset._last_video_problems = []
+        print(f"  Video frame counts OK across all episodes")
+
 
 def _needs_parquet_fix(table: pa.Table) -> bool:
     """Check if a parquet table needs schema fixes."""
@@ -562,6 +658,13 @@ def main():
     p.add_argument("--private", action="store_true", help="Create private dataset")
     p.add_argument("--readme-only", action="store_true", help="Only generate README, don't upload")
     p.add_argument("--num-workers", type=int, default=2, help="Concurrent upload workers (default: 2)")
+    p.add_argument("--ignore-video-mismatch", action="store_true",
+                   help="Upload even when a per-camera MP4 has fewer "
+                        "frames than its episode's parquet has rows. "
+                        "DANGEROUS: the training dataloader will read "
+                        "past the video's EOF on late frames. Only set "
+                        "this if you've truncated parquet rows elsewhere "
+                        "to match the short video.")
     args = p.parse_args()
 
     dataset_dir = args.dataset_dir
@@ -574,6 +677,16 @@ def main():
     # Cleanup: re-index episodes and remove orphans
     print("Cleaning up dataset...")
     cleanup_dataset(dataset_dir)
+
+    video_problems = getattr(cleanup_dataset, "_last_video_problems", [])
+    if video_problems and not args.ignore_video_mismatch:
+        print(f"\nRefusing to upload: {len(video_problems)} video/parquet "
+              f"mismatch(es) detected. Fix via "
+              f"examples/delete_episode.py or re-record those episodes, "
+              f"or pass --ignore-video-mismatch to upload anyway "
+              f"(dangerous — training will read past video EOF).",
+              file=sys.stderr)
+        sys.exit(1)
 
     info = json.loads(info_path.read_text())
 
