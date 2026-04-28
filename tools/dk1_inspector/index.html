@@ -1,0 +1,949 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DK1 Dataset Inspector</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+<style>
+  :root {
+    --bg: #15171c;
+    --panel: #1d2027;
+    --panel-2: #252932;
+    --border: #2c3038;
+    --text: #e6e8ec;
+    --muted: #9aa0aa;
+    --accent: #4aa3ff;
+    --accent-2: #ffb454;
+    --good: #5ec07a;
+    --bad: #e15b5b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+    overflow: hidden;
+  }
+
+  #app {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    grid-template-rows: 48px 1fr;
+    grid-template-areas: "topbar topbar" "sidebar main";
+    height: 100vh;
+    width: 100vw;
+  }
+  #app.collapsed { grid-template-columns: 36px 1fr; }
+
+  /* topbar */
+  #topbar {
+    grid-area: topbar;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  #topbar .title { font-weight: 600; margin-right: 8px; }
+  #topbar input[type="text"] {
+    flex: 1;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  #topbar button {
+    background: var(--accent);
+    color: #0a1320;
+    border: 0;
+    border-radius: 4px;
+    padding: 6px 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #topbar button:hover { filter: brightness(1.1); }
+  #topbar #status { color: var(--muted); font-size: 12px; min-width: 220px; }
+
+  /* sidebar */
+  #sidebar {
+    grid-area: sidebar;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  #sidebar header {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    position: sticky; top: 0; background: var(--panel); z-index: 1;
+  }
+  #sidebar header button {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 6px;
+    cursor: pointer;
+  }
+  .episode {
+    padding: 7px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .episode:hover { background: var(--panel-2); }
+  .episode.active { background: #2a3a55; }
+  .episode .idx { font-weight: 600; }
+  .episode .meta { color: var(--muted); font-size: 11px; }
+
+  #app.collapsed #sidebar { overflow: hidden; }
+  #app.collapsed #sidebar > *:not(header) { display: none; }
+  #app.collapsed #sidebar header { padding: 8px 4px; }
+  #app.collapsed #sidebar header span { display: none; }
+
+  /* main */
+  #main {
+    grid-area: main;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  #cameras {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    padding: 8px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .cam {
+    background: #000;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    aspect-ratio: 16 / 9;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+  }
+  .cam img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .cam .label {
+    position: absolute;
+    top: 4px; left: 6px;
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+  .cam .placeholder { color: var(--muted); font-size: 12px; }
+
+  #frame-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 6px 12px;
+    background: var(--panel-2);
+    border-bottom: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+  }
+  #frame-bar input[type="number"] {
+    width: 90px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 3px 6px;
+    color: var(--text);
+    font-family: inherit;
+  }
+  #frame-bar button {
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 3px 10px;
+    cursor: pointer;
+  }
+  #frame-bar button:hover { background: var(--border); }
+
+  #plot-area {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-rows: var(--signal-h, 240px) 6px 1fr;
+    overflow: hidden;
+    min-height: 0;
+  }
+  #signal-panel {
+    background: var(--panel);
+    padding: 6px 12px;
+    overflow-y: auto;
+    min-height: 60px;
+  }
+  #splitter {
+    background: var(--border);
+    cursor: row-resize;
+    border-top: 1px solid #1a1c22;
+    border-bottom: 1px solid #1a1c22;
+    position: relative;
+  }
+  #splitter::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 36px;
+    height: 2px;
+    background: var(--muted);
+    border-radius: 1px;
+    opacity: 0.6;
+  }
+  #splitter:hover::after, #splitter.dragging::after { opacity: 1; background: var(--accent); }
+  body.resizing { cursor: row-resize; user-select: none; }
+  .signal-group { margin-bottom: 4px; }
+  .signal-group summary {
+    cursor: pointer;
+    padding: 4px 0;
+    color: var(--accent-2);
+    font-weight: 600;
+    user-select: none;
+  }
+  .signal-group .controls {
+    display: flex;
+    gap: 6px;
+    padding: 2px 0 6px;
+  }
+  .signal-group .controls button {
+    background: var(--panel-2);
+    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 8px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .signal-group .controls button:hover { background: var(--border); color: var(--text); }
+  .signal-group .controls button.filter.active {
+    background: var(--accent);
+    color: #0a1320;
+    border-color: var(--accent);
+    font-weight: 600;
+  }
+  .signal-group .controls .ctrl-sep {
+    width: 1px;
+    background: var(--border);
+    margin: 0 2px;
+    align-self: stretch;
+  }
+  .signal-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+    gap: 2px 12px;
+    padding: 4px 8px 8px;
+  }
+  .signal-list label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 1px 0;
+  }
+  .signal-list input { margin: 0; }
+  .signal-list .swatch {
+    width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0;
+  }
+
+  #plot { width: 100%; height: 100%; min-height: 200px; }
+
+  .empty {
+    color: var(--muted);
+    text-align: center;
+    padding: 24px;
+  }
+  .toast-error {
+    color: var(--bad);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="topbar">
+    <span class="title">DK1 Inspector</span>
+    <button id="toggle-sidebar" title="Toggle sidebar">&#9776;</button>
+    <input id="path-input" type="text" spellcheck="false"
+           placeholder="/path/to/dataset (folder containing meta/, data/, videos/)" />
+    <button id="load-btn">Load</button>
+    <span id="status"></span>
+  </div>
+  <aside id="sidebar">
+    <header>
+      <span>Episodes</span>
+      <span id="ep-count"></span>
+    </header>
+    <div id="episode-list"></div>
+  </aside>
+  <main id="main">
+    <div id="cameras"></div>
+    <div id="frame-bar">
+      <span>Frame</span>
+      <input id="frame-input" type="number" min="0" step="1" value="0" />
+      <span>/ <span id="frame-total">0</span></span>
+      <button id="frame-prev">&larr; -1</button>
+      <button id="frame-next">+1 &rarr;</button>
+      <button id="frame-prev-10">&larr; -10</button>
+      <button id="frame-next-10">+10 &rarr;</button>
+      <span style="color:var(--muted);">t = <span id="time-display" style="color:#ffffff;font-weight:600;">0.000s</span></span>
+      <span style="margin-left:auto;color:var(--muted);">click plot to seek &middot; arrow keys step</span>
+    </div>
+    <div id="plot-area">
+      <div id="signal-panel">
+        <div id="signal-empty" class="empty">Load a dataset and select an episode to see signals.</div>
+        <div id="signal-groups"></div>
+      </div>
+      <div id="splitter" title="drag to resize"></div>
+      <div id="plot"></div>
+    </div>
+  </main>
+</div>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// state
+// ---------------------------------------------------------------------------
+const State = {
+  datasetPath: null,
+  info: null,            // /api/info payload
+  episode: null,         // /api/episode/N/series payload
+  selectedSignals: new Set(),  // string keys: "action:0", "state:14"
+  activeFilters: { action: new Set(), state: new Set() },
+  defaultsApplied: false,
+  frame: 0,
+  cameraEls: {},         // cam_key -> { wrapper, img }
+  inflightFrames: {},    // cam_key -> AbortController
+};
+
+const FILTER_DEFS = {
+  action: [
+    { dim: "side", key: "left",   label: "left",     match: n => n.startsWith("left_") },
+    { dim: "side", key: "right",  label: "right",    match: n => n.startsWith("right_") },
+    { dim: "side", key: "grip",   label: "grippers", match: n => n.includes("gripper") },
+  ],
+  state: [
+    { dim: "side", key: "left",   label: "left",     match: n => n.startsWith("left_") },
+    { dim: "side", key: "right",  label: "right",    match: n => n.startsWith("right_") },
+    { dim: "side", key: "grip",   label: "grippers", match: n => n.includes("gripper") },
+    { dim: "type", key: "pos",    label: "pos",      match: n => n.endsWith(".pos") },
+    { dim: "type", key: "vel",    label: "vel",      match: n => n.endsWith(".vel") },
+    { dim: "type", key: "torque", label: "torque",   match: n => n.endsWith(".torque") },
+  ],
+};
+
+function passesFilters(kind, name) {
+  const active = State.activeFilters[kind];
+  if (!active || active.size === 0) return true;
+  const defs = FILTER_DEFS[kind] || [];
+  const byDim = {};
+  for (const k of active) {
+    const f = defs.find(x => x.key === k);
+    if (!f) continue;
+    (byDim[f.dim] ||= []).push(f);
+  }
+  for (const dim of Object.keys(byDim)) {
+    if (!byDim[dim].some(f => f.match(name))) return false;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// utils
+// ---------------------------------------------------------------------------
+const COLOR_PALETTE = [
+  "#4aa3ff", "#ffb454", "#5ec07a", "#e15b5b", "#b48cff",
+  "#f08080", "#19c1c1", "#f5a623", "#7ed321", "#bd10e0",
+  "#50e3c2", "#9013fe", "#d0021b", "#417505", "#f8e71c",
+  "#8b572a", "#9b9b9b", "#4a90e2", "#ff5f6d", "#9d50bb",
+];
+function colorFor(idx) {
+  return COLOR_PALETTE[idx % COLOR_PALETTE.length];
+}
+
+function setStatus(text, isError = false) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.classList.toggle("toast-error", isError);
+}
+
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) {
+    let msg = `HTTP ${r.status}`;
+    try { const e = await r.json(); if (e.error) msg = e.error; } catch (_) {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+function pathQS() {
+  return "path=" + encodeURIComponent(State.datasetPath);
+}
+
+// Parse "action:3" / "state:0"
+function parseSig(key) {
+  const [k, idxStr] = key.split(":");
+  return { kind: k, idx: parseInt(idxStr, 10) };
+}
+function sigName(key) {
+  const { kind, idx } = parseSig(key);
+  if (kind === "action") return State.episode.action_names[idx] ?? `action[${idx}]`;
+  return State.episode.state_names[idx] ?? `observation.state[${idx}]`;
+}
+
+// ---------------------------------------------------------------------------
+// loading
+// ---------------------------------------------------------------------------
+async function loadDataset() {
+  const path = document.getElementById("path-input").value.trim();
+  if (!path) { setStatus("enter a dataset path", true); return; }
+  setStatus("loading dataset info…");
+  try {
+    State.datasetPath = path;
+    const info = await fetchJSON("/api/info?" + pathQS());
+    State.info = info;
+    State.episode = null;
+    State.defaultsApplied = false;
+    renderEpisodeList();
+    setStatus(`${info.total_episodes} episodes, ${info.total_frames} frames @ ${info.fps} fps`);
+    persistState();
+    if (info.episodes.length > 0) {
+      await selectEpisode(info.episodes[0].index);
+    }
+  } catch (e) {
+    setStatus(`load failed: ${e.message}`, true);
+  }
+}
+
+function renderEpisodeList() {
+  const list = document.getElementById("episode-list");
+  const count = document.getElementById("ep-count");
+  list.innerHTML = "";
+  count.textContent = State.info ? `${State.info.episodes.length}` : "";
+  if (!State.info) return;
+  for (const ep of State.info.episodes) {
+    const row = document.createElement("div");
+    row.className = "episode";
+    row.dataset.idx = ep.index;
+    row.innerHTML = `
+      <div>
+        <div class="idx">Ep ${ep.index}</div>
+        <div class="meta">${ep.length} frames &middot; ${(ep.length / State.info.fps).toFixed(1)}s</div>
+      </div>
+      <div class="meta" title="${escapeAttr(ep.task || '')}">${truncate(ep.task || '', 18)}</div>
+    `;
+    row.addEventListener("click", () => selectEpisode(ep.index));
+    list.appendChild(row);
+  }
+}
+
+function escapeAttr(s) { return String(s).replace(/[<>&"']/g, c =>
+  ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c])); }
+function truncate(s, n) { return s.length > n ? s.slice(0, n - 1) + "…" : s; }
+
+async function selectEpisode(epIdx) {
+  if (!State.info) return;
+  setStatus(`loading episode ${epIdx}…`);
+  document.querySelectorAll(".episode").forEach(el => {
+    el.classList.toggle("active", parseInt(el.dataset.idx, 10) === epIdx);
+  });
+  try {
+    const ep = await fetchJSON(`/api/episode/${epIdx}/series?` + pathQS());
+    State.episode = ep;
+    if (!State.defaultsApplied) {
+      applyDefaultSignals();
+      State.defaultsApplied = true;
+    }
+    renderSignalPanel();
+    renderCameras();
+    State.frame = 0;
+    document.getElementById("frame-input").value = 0;
+    document.getElementById("frame-total").textContent = ep.length - 1;
+    redrawPlot();
+    refreshFrame();
+    setStatus(`episode ${epIdx}: ${ep.length} frames`);
+    persistState();
+  } catch (e) {
+    setStatus(`episode load failed: ${e.message}`, true);
+  }
+}
+
+function applyDefaultSignals() {
+  // Default: gripper positions (action[6], action[13]) — simple, useful.
+  State.selectedSignals.clear();
+  const ep = State.episode;
+  const grip = (name) => ep.action_names.findIndex(n => n === name);
+  const i1 = grip("left_gripper.pos");
+  const i2 = grip("right_gripper.pos");
+  if (i1 >= 0) State.selectedSignals.add(`action:${i1}`);
+  if (i2 >= 0) State.selectedSignals.add(`action:${i2}`);
+  if (State.selectedSignals.size === 0 && ep.action_names.length > 0) {
+    State.selectedSignals.add("action:0");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// cameras
+// ---------------------------------------------------------------------------
+function renderCameras() {
+  const wrap = document.getElementById("cameras");
+  wrap.innerHTML = "";
+  State.cameraEls = {};
+  if (!State.episode) return;
+  const ep = State.episode;
+  for (const cam of ep.cameras) {
+    const v = (ep.videos && ep.videos[cam]) || null;
+    const tip = v ? [
+      `file: ${v.rel_path || v.filename}`,
+      `from: ${v.from_timestamp.toFixed(4)}s`,
+      `to:   ${v.to_timestamp.toFixed(4)}s`,
+      `dur:  ${(v.to_timestamp - v.from_timestamp).toFixed(4)}s`,
+    ].join("\n") : cam;
+    const div = document.createElement("div");
+    div.className = "cam";
+    div.innerHTML = `
+      <div class="placeholder">loading…</div>
+      <div class="label" title="${escapeAttr(tip)}">${cam.replace("observation.images.", "")}</div>
+    `;
+    const img = document.createElement("img");
+    img.alt = cam;
+    img.style.display = "none";
+    div.appendChild(img);
+    wrap.appendChild(div);
+    State.cameraEls[cam] = { wrapper: div, img };
+  }
+}
+
+function refreshFrame() {
+  if (!State.episode) return;
+  const f = State.frame;
+  document.getElementById("frame-input").value = f;
+  document.getElementById("time-display").textContent =
+      (f / State.episode.fps).toFixed(3) + "s";
+  for (const cam of State.episode.cameras) {
+    const slot = State.cameraEls[cam];
+    if (!slot) continue;
+    const url = `/api/frame/${encodeURIComponent(cam)}/${State.episode.episode_index}/${f}?` + pathQS();
+    if (State.inflightFrames[cam]) State.inflightFrames[cam].abort();
+    const ctrl = new AbortController();
+    State.inflightFrames[cam] = ctrl;
+    fetch(url, { signal: ctrl.signal })
+      .then(r => r.ok ? r.blob() : Promise.reject(new Error("HTTP " + r.status)))
+      .then(blob => {
+        const obj = URL.createObjectURL(blob);
+        const old = slot.img.src;
+        slot.img.onload = () => {
+          slot.img.style.display = "block";
+          const ph = slot.wrapper.querySelector(".placeholder");
+          if (ph) ph.remove();
+          if (old && old.startsWith("blob:")) URL.revokeObjectURL(old);
+        };
+        slot.img.src = obj;
+      })
+      .catch(err => {
+        if (err.name !== "AbortError") {
+          console.warn("frame fetch failed", cam, f, err);
+        }
+      });
+  }
+  updatePlotMarker();
+}
+
+// ---------------------------------------------------------------------------
+// signal panel
+// ---------------------------------------------------------------------------
+function renderSignalPanel() {
+  const empty = document.getElementById("signal-empty");
+  const groups = document.getElementById("signal-groups");
+  if (!State.episode) {
+    empty.style.display = "";
+    groups.innerHTML = "";
+    return;
+  }
+  empty.style.display = "none";
+  groups.innerHTML = "";
+  groups.appendChild(buildGroup("action", State.episode.action_names));
+  groups.appendChild(buildGroup("state",  State.episode.state_names));
+}
+
+function buildGroup(kind, names) {
+  const det = document.createElement("details");
+  det.className = "signal-group";
+  det.open = true;
+  const sum = document.createElement("summary");
+  sum.textContent = (kind === "action" ? "action" : "observation.state") + `  (${names.length})`;
+  det.appendChild(sum);
+
+  // Filter dimensions: filters within a dim OR together; across dims AND.
+  const filters = FILTER_DEFS[kind] || [];
+
+  const ctrls = document.createElement("div");
+  ctrls.className = "controls";
+  ctrls.innerHTML =
+    `<button data-act="select-visible">select visible</button>` +
+    `<button data-act="deselect-visible">deselect visible</button>` +
+    `<span class="ctrl-sep"></span>` +
+    filters.map(f => `<button class="filter" data-filter="${f.key}">${f.label}</button>`).join("") +
+    `<button data-act="clear-filters">clear filters</button>`;
+  det.appendChild(ctrls);
+
+  const list = document.createElement("div");
+  list.className = "signal-list";
+  names.forEach((name, idx) => {
+    const key = `${kind}:${idx}`;
+    const sigKey = signalColorKey(kind, idx, names.length);
+    const swatchColor = colorFor(sigKey);
+    const id = `sig-${kind}-${idx}`;
+    const lbl = document.createElement("label");
+    lbl.htmlFor = id;
+    lbl.dataset.idx = idx;
+    lbl.innerHTML = `
+      <input type="checkbox" id="${id}" />
+      <span class="swatch" style="background:${swatchColor};"></span>
+      <span>${escapeAttr(name)}</span>
+    `;
+    const cb = lbl.querySelector("input");
+    cb.checked = State.selectedSignals.has(key);
+    cb.addEventListener("change", () => {
+      if (cb.checked) State.selectedSignals.add(key);
+      else State.selectedSignals.delete(key);
+      redrawPlot();
+      persistState();
+    });
+    list.appendChild(lbl);
+  });
+  det.appendChild(list);
+
+  const activeFilters = State.activeFilters[kind];
+
+  function applyFilters() {
+    const labels = list.querySelectorAll("label");
+    let visibleCount = 0;
+    labels.forEach(lbl => {
+      const idx = parseInt(lbl.dataset.idx, 10);
+      const visible = passesFilters(kind, names[idx]);
+      lbl.style.display = visible ? "" : "none";
+      if (visible) visibleCount++;
+    });
+    ctrls.querySelectorAll("button.filter").forEach(btn => {
+      btn.classList.toggle("active", activeFilters.has(btn.dataset.filter));
+    });
+    const count = activeFilters.size > 0 ? `${visibleCount}/${names.length}` : `${names.length}`;
+    sum.textContent = (kind === "action" ? "action" : "observation.state") + `  (${count})`;
+  }
+
+  ctrls.addEventListener("click", e => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    if (btn.classList.contains("filter")) {
+      const k = btn.dataset.filter;
+      if (activeFilters.has(k)) activeFilters.delete(k);
+      else activeFilters.add(k);
+      applyFilters();
+      redrawPlot();
+      persistState();
+      return;
+    }
+    const action = btn.dataset.act;
+    if (action === "clear-filters") {
+      activeFilters.clear();
+      applyFilters();
+      redrawPlot();
+      persistState();
+      return;
+    }
+    if (action === "select-visible" || action === "deselect-visible") {
+      const visibleLabels = [...list.querySelectorAll("label")]
+        .filter(l => l.style.display !== "none");
+      visibleLabels.forEach(lbl => {
+        const idx = parseInt(lbl.dataset.idx, 10);
+        const sigKey = `${kind}:${idx}`;
+        const cb = lbl.querySelector("input");
+        if (action === "select-visible") {
+          State.selectedSignals.add(sigKey);
+          cb.checked = true;
+        } else {
+          State.selectedSignals.delete(sigKey);
+          cb.checked = false;
+        }
+      });
+      redrawPlot();
+      persistState();
+    }
+  });
+
+  // Apply any filter state carried over from a previous episode/reload.
+  applyFilters();
+
+  return det;
+}
+
+// Combine action + state into a shared color index so swatches match plot.
+function signalColorKey(kind, idx, _len) {
+  return (kind === "action" ? 0 : 100) + idx;
+}
+
+// ---------------------------------------------------------------------------
+// plot
+// ---------------------------------------------------------------------------
+let plotInitialized = false;
+
+function redrawPlot() {
+  const plotDiv = document.getElementById("plot");
+  if (!State.episode) {
+    Plotly.purge(plotDiv);
+    plotInitialized = false;
+    return;
+  }
+  const ep = State.episode;
+  const x = ep.frame_index;
+  const traces = [];
+  for (const key of State.selectedSignals) {
+    const { kind, idx } = parseSig(key);
+    const names = kind === "action" ? ep.action_names : ep.state_names;
+    const sigNm = names[idx];
+    if (!passesFilters(kind, sigNm)) continue;
+    const ys = (kind === "action" ? ep.action : ep.state)[idx];
+    const name = sigName(key);
+    traces.push({
+      type: "scattergl",
+      mode: "lines",
+      x, y: ys,
+      name: `${kind === "action" ? "a" : "s"}.${name}`,
+      line: {
+        color: colorFor(signalColorKey(kind, idx)),
+        width: 1.4,
+        dash: kind === "action" ? "dash" : "solid",
+      },
+      hovertemplate: "f=%{x}<br>%{y:.4f}<extra>" + name + "</extra>",
+    });
+  }
+  const layout = {
+    paper_bgcolor: "#15171c",
+    plot_bgcolor: "#15171c",
+    font: { color: "#e6e8ec", size: 11 },
+    margin: { l: 50, r: 16, t: 8, b: 36 },
+    xaxis: {
+      title: "frame_index",
+      gridcolor: "#2c3038",
+      zerolinecolor: "#2c3038",
+      range: [0, ep.length - 1],
+    },
+    yaxis: { gridcolor: "#2c3038", zerolinecolor: "#2c3038" },
+    legend: { orientation: "h", y: -0.18, font: { size: 10 } },
+    showlegend: traces.length > 0 && traces.length <= 24,
+    shapes: markerShape(),
+    dragmode: "pan",
+    hovermode: "x unified",
+  };
+  const config = { displaylogo: false, responsive: true, scrollZoom: true };
+  Plotly.react(plotDiv, traces, layout, config);
+  if (!plotInitialized) {
+    plotDiv.on("plotly_click", evt => {
+      if (!evt || !evt.points || !evt.points.length) return;
+      const x = evt.points[0].x;
+      jumpToFrame(Math.round(x));
+    });
+    // Also allow click on empty plot area to use x coord.
+    plotDiv.addEventListener("click", evt => {
+      // Plotly emits plotly_click for trace clicks; the dblclick uses x-axis only.
+    });
+    plotInitialized = true;
+  }
+}
+
+function markerShape() {
+  if (!State.episode) return [];
+  return [{
+    type: "line",
+    xref: "x", yref: "paper",
+    x0: State.frame, x1: State.frame,
+    y0: 0, y1: 1,
+    line: { color: "#ffb454", width: 1.5, dash: "dash" },
+  }];
+}
+
+function updatePlotMarker() {
+  const plotDiv = document.getElementById("plot");
+  if (!plotInitialized) return;
+  Plotly.relayout(plotDiv, { shapes: markerShape() }).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// frame stepping
+// ---------------------------------------------------------------------------
+function jumpToFrame(f) {
+  if (!State.episode) return;
+  const max = State.episode.length - 1;
+  f = Math.max(0, Math.min(max, f));
+  if (f === State.frame) return;
+  State.frame = f;
+  refreshFrame();
+}
+
+// ---------------------------------------------------------------------------
+// persistence
+// ---------------------------------------------------------------------------
+function persistState() {
+  try {
+    const s = {
+      path: State.datasetPath,
+      ep: State.episode ? State.episode.episode_index : null,
+      sigs: [...State.selectedSignals],
+      filters: {
+        action: [...State.activeFilters.action],
+        state:  [...State.activeFilters.state],
+      },
+    };
+    localStorage.setItem("dk1_inspector_state", JSON.stringify(s));
+  } catch (_) {}
+}
+
+function restoreState() {
+  try {
+    const raw = localStorage.getItem("dk1_inspector_state");
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    if (s.path) document.getElementById("path-input").value = s.path;
+    if (s.sigs && Array.isArray(s.sigs)) {
+      State.selectedSignals = new Set(s.sigs);
+      State.defaultsApplied = true; // skip auto-defaults if user had picks
+    }
+    if (s.filters) {
+      if (Array.isArray(s.filters.action)) State.activeFilters.action = new Set(s.filters.action);
+      if (Array.isArray(s.filters.state))  State.activeFilters.state  = new Set(s.filters.state);
+    }
+  } catch (_) {}
+}
+
+// ---------------------------------------------------------------------------
+// wiring
+// ---------------------------------------------------------------------------
+function wire() {
+  document.getElementById("load-btn").addEventListener("click", loadDataset);
+  document.getElementById("path-input").addEventListener("keydown", e => {
+    if (e.key === "Enter") loadDataset();
+  });
+  document.getElementById("toggle-sidebar").addEventListener("click", () => {
+    document.getElementById("app").classList.toggle("collapsed");
+    setTimeout(() => {
+      const plotDiv = document.getElementById("plot");
+      if (plotInitialized) Plotly.Plots.resize(plotDiv);
+    }, 50);
+  });
+  document.getElementById("frame-input").addEventListener("change", e => {
+    jumpToFrame(parseInt(e.target.value, 10) || 0);
+  });
+  document.getElementById("frame-prev").addEventListener("click", () => jumpToFrame(State.frame - 1));
+  document.getElementById("frame-next").addEventListener("click", () => jumpToFrame(State.frame + 1));
+  document.getElementById("frame-prev-10").addEventListener("click", () => jumpToFrame(State.frame - 10));
+  document.getElementById("frame-next-10").addEventListener("click", () => jumpToFrame(State.frame + 10));
+
+  window.addEventListener("keydown", e => {
+    if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+    if (e.key === "ArrowLeft")  { jumpToFrame(State.frame - (e.shiftKey ? 10 : 1)); e.preventDefault(); }
+    if (e.key === "ArrowRight") { jumpToFrame(State.frame + (e.shiftKey ? 10 : 1)); e.preventDefault(); }
+    if (e.key === "Home")  { jumpToFrame(0); e.preventDefault(); }
+    if (e.key === "End")   { jumpToFrame(State.episode ? State.episode.length - 1 : 0); e.preventDefault(); }
+  });
+
+  window.addEventListener("resize", () => {
+    if (plotInitialized) Plotly.Plots.resize(document.getElementById("plot"));
+  });
+
+  wireSplitter();
+}
+
+// ---------------------------------------------------------------------------
+// splitter
+// ---------------------------------------------------------------------------
+function wireSplitter() {
+  const splitter = document.getElementById("splitter");
+  const plotArea = document.getElementById("plot-area");
+  const root = document.documentElement;
+
+  // restore previous height
+  try {
+    const saved = parseInt(localStorage.getItem("dk1_signal_h") || "", 10);
+    if (saved > 60) root.style.setProperty("--signal-h", saved + "px");
+  } catch (_) {}
+
+  let dragging = false;
+  let startY = 0;
+  let startH = 0;
+
+  splitter.addEventListener("mousedown", e => {
+    dragging = true;
+    startY = e.clientY;
+    const rect = plotArea.firstElementChild.getBoundingClientRect();
+    startH = rect.height;
+    splitter.classList.add("dragging");
+    document.body.classList.add("resizing");
+    e.preventDefault();
+  });
+
+  window.addEventListener("mousemove", e => {
+    if (!dragging) return;
+    const areaRect = plotArea.getBoundingClientRect();
+    const splitterH = 6;
+    const minTop = 60;
+    const minBottom = 120;
+    const maxH = areaRect.height - splitterH - minBottom;
+    let newH = Math.max(minTop, Math.min(maxH, startH + (e.clientY - startY)));
+    root.style.setProperty("--signal-h", newH + "px");
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    splitter.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    if (plotInitialized) Plotly.Plots.resize(document.getElementById("plot"));
+    try {
+      const v = getComputedStyle(document.documentElement).getPropertyValue("--signal-h").trim();
+      if (v.endsWith("px")) localStorage.setItem("dk1_signal_h", parseInt(v, 10));
+    } catch (_) {}
+  });
+
+  splitter.addEventListener("dblclick", () => {
+    root.style.setProperty("--signal-h", "240px");
+    if (plotInitialized) Plotly.Plots.resize(document.getElementById("plot"));
+    try { localStorage.removeItem("dk1_signal_h"); } catch (_) {}
+  });
+}
+
+restoreState();
+wire();
+// Auto-load if a path was restored from prior session.
+if (document.getElementById("path-input").value) loadDataset();
+</script>
+</body>
+</html>
