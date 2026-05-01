@@ -534,15 +534,30 @@ def cleanup_dataset(dataset_dir: Path):
         meta_dict["dataset_from_index"][i] = global_idx
         meta_dict["dataset_to_index"][i] = global_idx + n_rows
 
-        # Fix video to_timestamp: must match scalar frame count, not MP4 frame count.
-        # The MP4 may contain trailing gesture frames that were trimmed from parquet.
+        # Fix video to_timestamp: must equal the timestamp at which the
+        # last episode frame ends in the MP4's PTS clock, i.e.
+        #   (n_rows + pts_offset) / fps  ==  n_rows/fps + from_timestamp
+        # The MP4 may contain trailing gesture frames AND leading NVENC
+        # priming frames; from_timestamp is per-camera and accounts for the
+        # latter, while n_rows excludes both. (An earlier version of this
+        # cleanup wrote n_rows/fps unconditionally, which is correct only
+        # when pts_offset == 0; on real-robot captures with NVENC pre-roll
+        # this dropped the last pts_offset frames of every episode.)
         fps = info.get("fps", 30)
-        expected_to_ts = n_rows / fps
-        for col in meta_dict:
-            if col.startswith("videos/") and col.endswith("/to_timestamp"):
-                if abs(meta_dict[col][i] - expected_to_ts) > 0.001:
-                    meta_changed = True
-                meta_dict[col][i] = expected_to_ts
+        n_rows_seconds = n_rows / fps
+        for col in list(meta_dict):
+            if not (col.startswith("videos/") and col.endswith("/to_timestamp")):
+                continue
+            from_col = col[: -len("/to_timestamp")] + "/from_timestamp"
+            from_ts = (
+                meta_dict[from_col][i]
+                if from_col in meta_dict
+                else 0.0
+            )
+            expected_to_ts = n_rows_seconds + from_ts
+            if abs(meta_dict[col][i] - expected_to_ts) > 0.001:
+                meta_changed = True
+            meta_dict[col][i] = expected_to_ts
 
         global_idx += n_rows
 
