@@ -43,10 +43,21 @@ class TeleopThread:
     """
 
     def __init__(self, follower, leader, target_hz: float = 250.0,
-                 auto_home_threshold: float = 0.0):
+                 auto_home_threshold: float = 0.0,
+                 startup_sync_duration: float = 1.5):
         self.follower = follower
         self.leader = leader
         self.target_hz = target_hz
+
+        # Startup sync: at thread start, capture the follower's actual pose
+        # and ramp linearly from there to the (live) leader pose over
+        # ``startup_sync_duration`` seconds, instead of snapping the follower
+        # to the leader on the very first send_action. Set to 0.0 to disable
+        # (preserves the legacy snap behaviour).
+        self._startup_sync_duration = max(0.0, float(startup_sync_duration))
+        self._startup_sync_active = self._startup_sync_duration > 0.0
+        self._startup_sync_t0: float = 0.0
+        self._startup_sync_start_action: dict[str, float] | None = None
 
         # Auto-home: when active and all joint positions within threshold
         # of zero, ramp commands from leader to zero over ramp_duration.
@@ -79,6 +90,11 @@ class TeleopThread:
     def actual_hz(self) -> float:
         """Exponential-moving-average of actual loop rate."""
         return self._actual_hz
+
+    @property
+    def startup_sync_active(self) -> bool:
+        """True while the startup ramp from follower-current-pose to leader is in progress."""
+        return self._startup_sync_active
 
     @property
     def auto_home_active(self) -> bool:
@@ -155,8 +171,57 @@ class TeleopThread:
             try:
                 action = self.leader.get_action()
 
+                # Startup sync: on the first cycle, snapshot the follower's
+                # actual pose and ramp linearly from there to the (live) leader
+                # pose over startup_sync_duration. Replaces the legacy "snap
+                # follower to leader on first send_action" behaviour. Auto-home
+                # logic is gated below so it does not compose with this ramp.
+                if self._startup_sync_active:
+                    if self._startup_sync_start_action is None:
+                        try:
+                            obs = self.follower.get_observation()
+                        except Exception:
+                            logger.exception(
+                                "Startup sync: follower.get_observation() failed; "
+                                "disabling ramp (legacy snap behaviour)"
+                            )
+                            self._startup_sync_active = False
+                            obs = None
+                        if obs is not None:
+                            self._startup_sync_start_action = {
+                                k: float(v) for k, v in obs.items()
+                                if isinstance(k, str) and k.endswith(".pos")
+                                and isinstance(v, (int, float))
+                            }
+                            self._startup_sync_t0 = time.perf_counter()
+                            logger.info(
+                                "Startup sync: ramping follower to leader over %.2fs "
+                                "(captured %d .pos joints)",
+                                self._startup_sync_duration,
+                                len(self._startup_sync_start_action),
+                            )
+
+                    if self._startup_sync_active and self._startup_sync_start_action is not None:
+                        t = (time.perf_counter() - self._startup_sync_t0) / self._startup_sync_duration
+                        if t >= 1.0:
+                            self._startup_sync_active = False
+                            self._startup_sync_start_action = None
+                            logger.info("Startup sync: complete; pass-through resumed")
+                            # action stays as the live leader pose
+                        else:
+                            start = self._startup_sync_start_action
+                            # Ramp ALL .pos keys (joints AND grippers) so
+                            # nothing snaps. Non-.pos values pass through.
+                            action = {
+                                k: (start[k] * (1.0 - t) + v * t
+                                    if k in start
+                                    else v)
+                                for k, v in action.items()
+                            }
+
                 # Auto-home release: smooth ramp from zero back to leader
-                if self._auto_home_releasing:
+                # (skipped while startup-sync is still ramping)
+                if not self._startup_sync_active and self._auto_home_releasing:
                     now = time.perf_counter()
                     t = min(1.0, (now - self._auto_home_release_start)
                             / self._auto_home_ramp_duration)
@@ -176,8 +241,9 @@ class TeleopThread:
                 # Auto-home: when active and leader joints are near zero,
                 # ramp follower commands from leader to zero over ramp_duration.
                 # Once ramped, hold at zero. Cancel if leader exits threshold.
-                # Skip while releasing (ramp-out has priority).
-                elif (self._auto_home_active
+                # Skip while releasing (ramp-out has priority) or syncing.
+                elif (not self._startup_sync_active
+                        and self._auto_home_active
                         and self._auto_home_threshold > 0):
                     threshold = self._auto_home_threshold
                     max_joint_error = max(

@@ -211,6 +211,12 @@ def build_argparser() -> argparse.ArgumentParser:
              "0 = disabled). Uses hysteresis to prevent immediate snap.",
     )
     p.add_argument(
+        "--startup-sync", type=float, default=1.5, metavar="SECONDS",
+        help="Smoothly ramp the follower from its current pose to the leader "
+             "pose over SECONDS at teleop start, instead of snapping. "
+             "Set to 0 to disable (legacy snap behaviour). Default: 1.5s.",
+    )
+    p.add_argument(
         "--visualize", action="store_true",
         help="Enable Rerun visualization (opt-in)",
     )
@@ -425,6 +431,7 @@ def main():
         leader=leader,
         target_hz=args.teleop_hz,
         auto_home_threshold=args.auto_home,
+        startup_sync_duration=args.startup_sync,
     )
 
     # Rerun (opt-in) — init before recorder so it can log frames
@@ -599,6 +606,7 @@ def main():
   Video:   {args.camera_width}x{args.camera_height} @ {args.camera_fps}fps capture, {args.fps}fps recording
   Obs:     {args.obs_signals} ({len(obs_state_keys)} elements)
   Home:    {"auto @ %.2f rad" % args.auto_home if args.auto_home > 0 else "manual"}
+  Sync:    {"%.1fs ramp" % args.startup_sync if args.startup_sync > 0 else "snap (disabled)"}
   Teleop:  {args.teleop_hz:.0f} Hz
 
   {_B}Keyboard controls:{_N}
