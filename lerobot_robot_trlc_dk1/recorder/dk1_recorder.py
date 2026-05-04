@@ -866,8 +866,7 @@ def _run_event_loop(
                         audio.countdown_go()
                     recorder.begin_episode(episode_index)
                     # Reset auto-home: must depart before ramp can activate
-                    teleop._auto_home_departed = False
-                    teleop._auto_home_ramping = False
+                    teleop.reset_auto_home()
                     state = RecorderState.RECORDING
                     last_transition_time = time.monotonic()
                     logger.info("Countdown complete — recording started")

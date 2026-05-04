@@ -42,6 +42,8 @@ class TeleopThread:
     ``leader.get_action()`` returns a fresh dict each call).
     """
 
+    ARMS: tuple[str, ...] = ("left", "right")
+
     def __init__(self, follower, leader, target_hz: float = 250.0,
                  auto_home_threshold: float = 0.0,
                  startup_sync_duration: float = 1.5):
@@ -59,19 +61,31 @@ class TeleopThread:
         self._startup_sync_t0: float = 0.0
         self._startup_sync_start_action: dict[str, float] | None = None
 
-        # Auto-home: when active and all joint positions within threshold
-        # of zero, ramp commands from leader to zero over ramp_duration.
-        # Uses hysteresis: operator must first move away before ramp activates.
+        # Auto-home: when active and an arm's joint positions fall within
+        # ``auto_home_threshold`` of zero, ramp that arm's commands from
+        # leader to zero over ramp_duration. Per-arm state so one arm can
+        # hold at zero while the other follows the leader. Hysteresis:
+        # operator must first move away before the ramp arms.
         self._auto_home_threshold = auto_home_threshold
         self._auto_home_ramp_duration = 1.0  # seconds for ramp in/out
         self._auto_home_active = False
-        self._auto_home_departed = False
-        self._auto_home_ramp_start: float = 0.0  # perf_counter when ramp began
-        self._auto_home_ramp_action: dict[str, float] | None = None  # leader snapshot at ramp start
-        self._auto_home_ramping = False
-        # Ramp-out: smooth return from zero back to leader after episode save
-        self._auto_home_releasing = False
-        self._auto_home_release_start: float = 0.0
+
+        # Per-arm state dicts, keyed by arm name ("left", "right").
+        self._auto_home_departed: dict[str, bool] = {a: False for a in self.ARMS}
+        self._auto_home_ramping: dict[str, bool] = {a: False for a in self.ARMS}
+        self._auto_home_ramp_start: dict[str, float] = {a: 0.0 for a in self.ARMS}
+        # Leader snapshot (arm's joint-pos keys only) captured when ramp starts.
+        self._auto_home_ramp_action: dict[str, dict[str, float] | None] = {
+            a: None for a in self.ARMS
+        }
+        # Ramp-out: smooth return from "held" pose back to leader. Held is
+        # whatever the follower was last commanded to (not necessarily zero,
+        # since release may fire mid-ramp when leader exits threshold).
+        self._auto_home_releasing: dict[str, bool] = {a: False for a in self.ARMS}
+        self._auto_home_release_start: dict[str, float] = {a: 0.0 for a in self.ARMS}
+        self._auto_home_release_from: dict[str, dict[str, float] | None] = {
+            a: None for a in self.ARMS
+        }
 
         # Latest action — read by recorder thread (atomic reference swap).
         self._latest_action: dict[str, float] | None = None
@@ -103,40 +117,140 @@ class TeleopThread:
 
     @property
     def auto_home_ramping(self) -> bool:
-        """True while the auto-home ramp-to-zero is in progress (including hold)."""
-        return self._auto_home_ramping
+        """True while any arm is ramping toward / holding at zero."""
+        return any(self._auto_home_ramping.values())
 
     @property
     def auto_home_at_rest(self) -> bool:
-        """True when auto-home ramp completed and robot is held at zero."""
-        if not self._auto_home_ramping:
-            return False
-        elapsed = time.perf_counter() - self._auto_home_ramp_start
-        return elapsed >= self._auto_home_ramp_duration
+        """True only when ALL arms have completed their ramp to zero."""
+        now = time.perf_counter()
+        for arm in self.ARMS:
+            if not self._auto_home_ramping[arm]:
+                return False
+            if now - self._auto_home_ramp_start[arm] < self._auto_home_ramp_duration:
+                return False
+        return True
 
     @auto_home_active.setter
     def auto_home_active(self, value: bool):
         if not value:
-            self._auto_home_ramping = False
-            # Don't clear _auto_home_releasing — the release ramp must
-            # continue even after auto_home is deactivated.
+            # Clear ramping flags; keep any in-flight release so the
+            # smooth ramp-back to leader still completes.
+            for arm in self.ARMS:
+                self._auto_home_ramping[arm] = False
         self._auto_home_active = value
 
-    def release_auto_home(self):
-        """Start smooth ramp from zero back to leader (call after episode save).
+    def reset_auto_home(self):
+        """Re-arm auto-home for a new episode (clears departure + ramp flags).
 
-        If the robot was held at zero (ramping), starts a smooth release ramp.
-        If not (e.g. gesture-triggered end away from home), just resets state
-        so auto-home can re-arm for the next episode.
+        Does not touch in-flight releases — they must complete uninterrupted.
         """
-        if self._auto_home_ramping:
-            # Was holding at zero — smooth ramp back to leader
-            self._auto_home_ramping = False
-            self._auto_home_releasing = True
-            self._auto_home_release_start = time.perf_counter()
-            logger.debug("Auto-home: releasing (ramp back to teleop)")
-        # Reset departure so auto-home must re-arm
-        self._auto_home_departed = False
+        for arm in self.ARMS:
+            self._auto_home_departed[arm] = False
+            self._auto_home_ramping[arm] = False
+
+    def release_auto_home(self):
+        """Start smooth ramp back to leader for every ramping arm.
+
+        Call after episode save. Each ramping arm gets a per-arm release
+        that lerps from its current held pose (not necessarily zero — it
+        may have been mid-ramp) back to the current leader command.
+        """
+        now = time.perf_counter()
+        for arm in self.ARMS:
+            if self._auto_home_ramping[arm]:
+                self._begin_release(arm, now)
+            # Re-arm departure hysteresis for the next episode
+            self._auto_home_departed[arm] = False
+
+    def _begin_release(self, arm: str, now: float):
+        """Snapshot the currently-commanded held pose and start the release ramp."""
+        start = self._auto_home_ramp_action[arm] or {}
+        ramp_t = min(1.0, (now - self._auto_home_ramp_start[arm])
+                     / self._auto_home_ramp_duration)
+        # Wherever the follower actually is right now: start * (1 - ramp_t).
+        # At ramp_t=1 this is zero; at ramp_t<1 it's partway to zero.
+        held = {k: v * (1.0 - ramp_t) for k, v in start.items()}
+        self._auto_home_ramping[arm] = False
+        self._auto_home_releasing[arm] = True
+        self._auto_home_release_start[arm] = now
+        self._auto_home_release_from[arm] = held
+        logger.debug("Auto-home[%s]: releasing from ramp_t=%.2f", arm, ramp_t)
+
+    @staticmethod
+    def _is_arm_joint(key: str, arm: str) -> bool:
+        """True for arm-prefixed non-gripper position keys (e.g. ``left_joint_1.pos``)."""
+        return (key.startswith(f"{arm}_")
+                and ".pos" in key
+                and "gripper" not in key)
+
+    def _apply_auto_home(self, arm: str, action: dict, now: float) -> dict:
+        """Apply per-arm auto-home / release to ``action``. Returns modified dict."""
+        # Release ramp: smooth lerp from held snapshot back to current leader.
+        if self._auto_home_releasing[arm]:
+            t = min(1.0, (now - self._auto_home_release_start[arm])
+                    / self._auto_home_ramp_duration)
+            if t >= 1.0:
+                self._auto_home_releasing[arm] = False
+                self._auto_home_release_from[arm] = None
+                logger.debug("Auto-home[%s]: release complete", arm)
+                return action  # leader pass-through
+            held = self._auto_home_release_from[arm] or {}
+            return {
+                k: (held[k] * (1.0 - t) + v * t
+                    if self._is_arm_joint(k, arm) and k in held
+                    else v)
+                for k, v in action.items()
+            }
+
+        if not (self._auto_home_active and self._auto_home_threshold > 0):
+            return action
+
+        arm_joints = {k: v for k, v in action.items() if self._is_arm_joint(k, arm)}
+        if not arm_joints:
+            return action
+        max_err = max(abs(v) for v in arm_joints.values())
+        threshold = self._auto_home_threshold
+
+        if not self._auto_home_departed[arm]:
+            # Hysteresis: arm must first move away (fixed at 0.5 rad, matches
+            # rest-pose departure threshold — independent of ``threshold``).
+            if max_err > 0.5:
+                self._auto_home_departed[arm] = True
+                logger.debug("Auto-home[%s]: departed (max_err=%.2f rad)",
+                             arm, max_err)
+            return action
+
+        if max_err >= threshold:
+            # Leader outside threshold — if we were ramping, start a smooth
+            # release from the current held pose instead of jumping to leader.
+            if self._auto_home_ramping[arm]:
+                self._begin_release(arm, now)
+                held = self._auto_home_release_from[arm] or {}
+                # First release frame: t=0, command = held (no discontinuity).
+                return {
+                    k: (held[k] if self._is_arm_joint(k, arm) and k in held else v)
+                    for k, v in action.items()
+                }
+            return action
+
+        # Leader within threshold — engage / continue ramp toward zero
+        if not self._auto_home_ramping[arm]:
+            self._auto_home_ramping[arm] = True
+            self._auto_home_ramp_start[arm] = now
+            self._auto_home_ramp_action[arm] = dict(arm_joints)
+            logger.debug("Auto-home[%s]: ramp started (max_err=%.3f rad)",
+                         arm, max_err)
+
+        t = min(1.0, (now - self._auto_home_ramp_start[arm])
+                / self._auto_home_ramp_duration)
+        start = self._auto_home_ramp_action[arm] or {}
+        return {
+            k: (start[k] * (1.0 - t)
+                if self._is_arm_joint(k, arm) and k in start
+                else v)
+            for k, v in action.items()
+        }
 
     @property
     def jitter_count(self) -> int:
@@ -174,8 +288,8 @@ class TeleopThread:
                 # Startup sync: on the first cycle, snapshot the follower's
                 # actual pose and ramp linearly from there to the (live) leader
                 # pose over startup_sync_duration. Replaces the legacy "snap
-                # follower to leader on first send_action" behaviour. Auto-home
-                # logic is gated below so it does not compose with this ramp.
+                # follower to leader on first send_action" behaviour. Per-arm
+                # auto-home is gated below so it does not compose with this.
                 if self._startup_sync_active:
                     if self._startup_sync_start_action is None:
                         try:
@@ -219,76 +333,14 @@ class TeleopThread:
                                 for k, v in action.items()
                             }
 
-                # Auto-home release: smooth ramp from zero back to leader
-                # (skipped while startup-sync is still ramping)
-                if not self._startup_sync_active and self._auto_home_releasing:
+                # Per-arm auto-home (release / engage / hold). Gated off
+                # while the startup-sync ramp is still running so the two
+                # don't compose. Each arm runs its own state machine, so
+                # one arm can hold at zero while the other teleops.
+                if not self._startup_sync_active:
                     now = time.perf_counter()
-                    t = min(1.0, (now - self._auto_home_release_start)
-                            / self._auto_home_ramp_duration)
-                    if t >= 1.0:
-                        self._auto_home_releasing = False
-                        logger.debug("Auto-home: release complete, teleop resumed")
-                        # action is already the leader — pass through
-                    else:
-                        # Lerp: cmd = zero * (1-t) + leader * t = leader * t
-                        action = {
-                            k: (v * t
-                                if ".pos" in k and "gripper" not in k
-                                else v)
-                            for k, v in action.items()
-                        }
-
-                # Auto-home: when active and leader joints are near zero,
-                # ramp follower commands from leader to zero over ramp_duration.
-                # Once ramped, hold at zero. Cancel if leader exits threshold.
-                # Skip while releasing (ramp-out has priority) or syncing.
-                elif (not self._startup_sync_active
-                        and self._auto_home_active
-                        and self._auto_home_threshold > 0):
-                    threshold = self._auto_home_threshold
-                    max_joint_error = max(
-                        (abs(v) for k, v in action.items()
-                         if ".pos" in k and "gripper" not in k),
-                        default=0.0,
-                    )
-
-                    if not self._auto_home_departed:
-                        # Must move away from zero first — fixed at 0.5 rad
-                        # (matches rest pose departure), independent of threshold.
-                        if max_joint_error > 0.5:
-                            self._auto_home_departed = True
-                            logger.debug("Auto-home: departed (max_err=%.2f rad)",
-                                        max_joint_error)
-                    elif max_joint_error >= threshold:
-                        # Leader moved outside threshold — cancel ramp
-                        if self._auto_home_ramping:
-                            self._auto_home_ramping = False
-                            logger.debug("Auto-home: cancelled (leader left threshold)")
-                    else:
-                        # Leader within threshold
-                        now = time.perf_counter()
-                        if not self._auto_home_ramping:
-                            # Start ramp: snapshot current leader as start point
-                            self._auto_home_ramping = True
-                            self._auto_home_ramp_start = now
-                            self._auto_home_ramp_action = {
-                                k: v for k, v in action.items()
-                                if ".pos" in k and "gripper" not in k
-                            }
-                            logger.debug("Auto-home: ramp started (max_err=%.3f rad)",
-                                        max_joint_error)
-
-                        # Ramp progress: 0 → 1 over ramp_duration, then hold at zero
-                        t = min(1.0, (now - self._auto_home_ramp_start)
-                                / self._auto_home_ramp_duration)
-                        # Lerp: cmd = start * (1 - t); at t=1 this is zero (hold)
-                        start = self._auto_home_ramp_action
-                        action = {
-                            k: (start[k] * (1.0 - t)
-                                if k in start
-                                else v)
-                            for k, v in action.items()
-                        }
+                    for arm in self.ARMS:
+                        action = self._apply_auto_home(arm, action, now)
 
                 self.follower.send_action(action)
                 self._latest_action = action  # atomic reference swap
