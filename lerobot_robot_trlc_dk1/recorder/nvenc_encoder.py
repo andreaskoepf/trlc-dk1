@@ -356,6 +356,14 @@ class NvencEncoder:
             except ValueError:
                 pass
 
+        # Capture size BEFORE posting the result: once the main thread sees
+        # the result, a rerecord (backspace) will unlink the MP4 and stat()
+        # would race with that deletion.
+        try:
+            size_mb = mp4_path.stat().st_size / 1e6
+        except FileNotFoundError:
+            size_mb = 0.0
+
         result = EncoderResult(
             episode_index=ep_index,
             mp4_path=mp4_path,
@@ -367,6 +375,5 @@ class NvencEncoder:
 
         logger.debug(
             "Encoder %s: episode %d done (%d pre-roll + %d episode frames, %.1f MB)",
-            self.cam_key, ep_index, pre_roll_frames, episode_frames,
-            mp4_path.stat().st_size / 1e6 if mp4_path.exists() else 0,
+            self.cam_key, ep_index, pre_roll_frames, episode_frames, size_mb,
         )

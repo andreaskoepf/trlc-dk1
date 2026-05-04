@@ -394,6 +394,81 @@ def _verify_video_frame_counts(dataset_dir: Path, meta_dict: dict,
     return problems
 
 
+def check_dataset(dataset_dir: Path) -> bool:
+    """Read-only dataset health check. Returns True if no issues found.
+
+    Reports on the same classes of problems that ``cleanup_dataset``
+    would fix or fail on (non-contiguous episode indices, orphan data /
+    video files, video/parquet frame-count mismatches), but never
+    writes to disk.
+    """
+    info_path = dataset_dir / "meta" / "info.json"
+    meta_path = dataset_dir / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+
+    info = json.loads(info_path.read_text())
+    chunks_size = info.get("chunks_size", 1000)
+
+    issues: list[str] = []
+
+    if not meta_path.exists():
+        print(f"  No episode metadata at {meta_path}")
+        return True
+
+    meta = pq.read_table(meta_path)
+    meta_dict = meta.to_pydict()
+    episode_indices = meta_dict["episode_index"]
+    n = len(episode_indices)
+    print(f"  {n} episodes in metadata")
+
+    if episode_indices != list(range(n)):
+        issues.append(
+            f"episode indices non-contiguous: {episode_indices[0]}..{episode_indices[-1]} "
+            f"(would re-index to 0..{n-1})"
+        )
+
+    valid_eps = set(episode_indices)
+    orphan_data: list[Path] = []
+    for f in sorted((dataset_dir / "data").rglob("*.parquet")):
+        try:
+            file_idx = int(f.stem.split("-")[-1])
+            chunk = int(f.parent.name.split("-")[-1])
+            if chunk * chunks_size + file_idx not in valid_eps:
+                orphan_data.append(f)
+        except (ValueError, IndexError):
+            pass
+    orphan_videos: list[Path] = []
+    video_root = dataset_dir / "videos"
+    if video_root.exists():
+        for f in sorted(video_root.rglob("*.mp4")):
+            try:
+                file_idx = int(f.stem.split("-")[-1])
+                chunk = int(f.parent.name.split("-")[-1])
+                if chunk * chunks_size + file_idx not in valid_eps:
+                    orphan_videos.append(f)
+            except (ValueError, IndexError):
+                pass
+    if orphan_data or orphan_videos:
+        issues.append(
+            f"{len(orphan_data)} orphan parquet + {len(orphan_videos)} orphan "
+            f"mp4 files (would be deleted by cleanup)"
+        )
+
+    print("  Verifying video frame counts match parquet row counts ...")
+    video_problems = _verify_video_frame_counts(dataset_dir, meta_dict, chunks_size)
+    for p in video_problems:
+        issues.append(p)
+
+    print()
+    if not issues:
+        print(f"  Dataset OK: {n} episodes — no issues detected (dry-run)")
+        return True
+
+    print(f"  Found {len(issues)} issue(s):")
+    for msg in issues:
+        print(f"    - {msg}")
+    return False
+
+
 def cleanup_dataset(dataset_dir: Path):
     """Remove orphan files, re-index episodes contiguously, fix global index.
 
@@ -534,30 +609,15 @@ def cleanup_dataset(dataset_dir: Path):
         meta_dict["dataset_from_index"][i] = global_idx
         meta_dict["dataset_to_index"][i] = global_idx + n_rows
 
-        # Fix video to_timestamp: must equal the timestamp at which the
-        # last episode frame ends in the MP4's PTS clock, i.e.
-        #   (n_rows + pts_offset) / fps  ==  n_rows/fps + from_timestamp
-        # The MP4 may contain trailing gesture frames AND leading NVENC
-        # priming frames; from_timestamp is per-camera and accounts for the
-        # latter, while n_rows excludes both. (An earlier version of this
-        # cleanup wrote n_rows/fps unconditionally, which is correct only
-        # when pts_offset == 0; on real-robot captures with NVENC pre-roll
-        # this dropped the last pts_offset frames of every episode.)
+        # Fix video to_timestamp: must match scalar frame count, not MP4 frame count.
+        # The MP4 may contain trailing gesture frames that were trimmed from parquet.
         fps = info.get("fps", 30)
-        n_rows_seconds = n_rows / fps
-        for col in list(meta_dict):
-            if not (col.startswith("videos/") and col.endswith("/to_timestamp")):
-                continue
-            from_col = col[: -len("/to_timestamp")] + "/from_timestamp"
-            from_ts = (
-                meta_dict[from_col][i]
-                if from_col in meta_dict
-                else 0.0
-            )
-            expected_to_ts = n_rows_seconds + from_ts
-            if abs(meta_dict[col][i] - expected_to_ts) > 0.001:
-                meta_changed = True
-            meta_dict[col][i] = expected_to_ts
+        expected_to_ts = n_rows / fps
+        for col in meta_dict:
+            if col.startswith("videos/") and col.endswith("/to_timestamp"):
+                if abs(meta_dict[col][i] - expected_to_ts) > 0.001:
+                    meta_changed = True
+                meta_dict[col][i] = expected_to_ts
 
         global_idx += n_rows
 
@@ -672,6 +732,10 @@ def main():
     p.add_argument("--license", type=str, default="apache-2.0", help="License identifier")
     p.add_argument("--private", action="store_true", help="Create private dataset")
     p.add_argument("--readme-only", action="store_true", help="Only generate README, don't upload")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Read-only check: verify video/parquet consistency, "
+                        "orphans, and episode-index contiguity. Does not "
+                        "modify the dataset or upload.")
     p.add_argument("--num-workers", type=int, default=2, help="Concurrent upload workers (default: 2)")
     p.add_argument("--ignore-video-mismatch", action="store_true",
                    help="Upload even when a per-camera MP4 has fewer "
@@ -688,6 +752,10 @@ def main():
     if not info_path.exists():
         print(f"Error: {info_path} not found. Is this a valid dataset directory?", file=sys.stderr)
         sys.exit(1)
+
+    if args.dry_run:
+        ok = check_dataset(dataset_dir)
+        sys.exit(0 if ok else 1)
 
     # Cleanup: re-index episodes and remove orphans
     print("Cleaning up dataset...")

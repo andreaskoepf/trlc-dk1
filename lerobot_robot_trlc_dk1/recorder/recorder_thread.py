@@ -486,12 +486,37 @@ class RecorderThread:
                 from lerobot_robot_trlc_dk1.recorder.rest_pose_detector import (
                     _JOINT_POS_INDICES, _VEL_INDICES,
                 )
-                pos_err = float(np.max(np.abs(obs_state[_JOINT_POS_INDICES])))
-                max_vel = float(np.max(np.abs(obs_state[_VEL_INDICES])))
-                if pos_err < 0.1 and max_vel < 0.1:
+                joint_pos = obs_state[_JOINT_POS_INDICES]
+                joint_vel = obs_state[_VEL_INDICES]
+                pos_err = float(np.max(np.abs(joint_pos)))
+                max_vel = float(np.max(np.abs(joint_vel)))
+                pos_ok = pos_err < 0.1
+                vel_ok = max_vel < 0.1
+                if pos_ok and vel_ok:
                     self._auto_home_settle_count += 1
                 else:
                     self._auto_home_settle_count = 0
+
+                # Heartbeat (~1 Hz): when we enter this branch we EXPECT
+                # termination, so emit the blocking condition at INFO so
+                # a stuck episode self-reports which check is failing.
+                if self.frame_index % max(1, self.fps) == 0:
+                    worst_pos_key = OBS_STATE_KEYS[
+                        _JOINT_POS_INDICES[int(np.argmax(np.abs(joint_pos)))]]
+                    worst_vel_key = OBS_STATE_KEYS[
+                        _VEL_INDICES[int(np.argmax(np.abs(joint_vel)))]]
+                    logger.info(
+                        "Auto-home settle frame %d: pos_err=%.3f (%s) "
+                        "vel=%.3f (%s) | %s/%s | settle=%d/%d",
+                        self.frame_index,
+                        pos_err, worst_pos_key,
+                        max_vel, worst_vel_key,
+                        "pos_ok" if pos_ok else "POS_FAIL",
+                        "vel_ok" if vel_ok else "VEL_FAIL",
+                        self._auto_home_settle_count,
+                        max(1, self.fps // 10),
+                    )
+
                 # ~100ms settle at recording fps
                 if self._auto_home_settle_count >= max(1, self.fps // 10):
                     logger.info(

@@ -14,6 +14,7 @@
 
 from dataclasses import dataclass, field
 from functools import cached_property
+import sys
 import time
 import logging
 from typing import Any
@@ -106,7 +107,9 @@ class BiDK1Follower(Robot):
         return self.left_arm.is_connected and self.right_arm.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
     def connect(self) -> None:
+        print(f"[bi_follower] connecting LEFT arm (port={self.config.left_arm_port})", file=sys.stderr, flush=True)
         self.left_arm.connect()
+        print(f"[bi_follower] connecting RIGHT arm (port={self.config.right_arm_port})", file=sys.stderr, flush=True)
         self.right_arm.connect()
 
         for cam in self.cameras.values():
