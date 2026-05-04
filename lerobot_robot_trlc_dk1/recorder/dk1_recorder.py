@@ -1051,6 +1051,21 @@ def _save_episode(
     # 1. Stop recorder — returns buffered scalar frames + signals encoders
     scalar_frames = recorder.end_episode()
 
+    # Surface motor-staleness summary collected during this episode so
+    # the operator can decide whether to keep / re-record. Cabling /
+    # firmware faults that silence a motor's state replies (the C++
+    # producer keeps republishing the cached value, so the parquet
+    # looks live but is bit-frozen) become visible here.
+    try:
+        stale = recorder.health_summary()
+    except AttributeError:
+        stale = None
+    if stale and any(stale.get(s) for s in ("left", "right")):
+        logger.warning(
+            "Episode %d recorded with stale motors: %s",
+            episode_index, stale,
+        )
+
     # 2. Trim trailing gesture frames from scalar buffer
     if trim_tail_frames > 0 and len(scalar_frames) > trim_tail_frames:
         original_len = len(scalar_frames)

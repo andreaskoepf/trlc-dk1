@@ -189,6 +189,28 @@ class RecorderThread:
         # Only held for fast queue operations, never during camera reads.
         self._episode_lock = threading.Lock()
 
+        # Per-motor staleness monitoring. The C++ RT loop tracks
+        # ``motor_stale[7]`` (per arm) — flips true if a motor hasn't
+        # sent a state reply in ``per_motor_stale_threshold`` cycles.
+        # Bus / cabling problems (e.g. a gripper that still receives
+        # commands but stops emitting state) are otherwise invisible
+        # to the recorder: the producer keeps republishing the last
+        # cached value forever, so the parquet looks live but is
+        # frozen at one float for thousands of rows. Polling
+        # ``get_health()`` once per second and logging on transition
+        # surfaces the failure live so you can stop the session
+        # instead of finding garbage data afterwards.
+        self._motor_names = ["joint_1", "joint_2", "joint_3", "joint_4",
+                             "joint_5", "joint_6", "gripper"]
+        # (side, motor_idx) -> first frame_index where stale was seen
+        self._stale_first_seen: dict[tuple[str, int], int] = {}
+        # (side, motor_idx) -> total frames where stale was observed
+        self._stale_frames: dict[tuple[str, int], int] = {}
+        # previous-poll stale state so we only log on transitions
+        self._stale_prev: dict[tuple[str, int], bool] = {}
+        self._health_poll_period = max(1, int(self.fps))  # ~1 Hz
+        self._health_poll_counter = 0
+
     @property
     def actual_fps(self) -> float:
         return self._actual_fps
@@ -224,6 +246,13 @@ class RecorderThread:
         """
         # Collect garbage now so it doesn't trigger during recording
         gc.collect()
+
+        # Reset per-episode motor-staleness tracking so health_summary()
+        # at end_episode reports staleness scoped to THIS episode.
+        self._stale_first_seen = {}
+        self._stale_frames = {}
+        self._stale_prev = {}
+        self._health_poll_counter = 0
 
         # Tell encoders to open containers and start accepting frames
         for enc in self.encoders.values():
@@ -350,6 +379,14 @@ class RecorderThread:
             logger.exception("Failed to read joint state")
             return
         t_joints = time.perf_counter()
+
+        # 1b. Per-motor staleness check (cheap seqlock read on the C++
+        # health snapshot). Polled at ~1 Hz so it doesn't add overhead
+        # to the recording hot path.
+        self._health_poll_counter += 1
+        if self._health_poll_counter >= self._health_poll_period:
+            self._health_poll_counter = 0
+            self._poll_motor_health()
 
         # 2. Read cameras one by one with timing.
         #    async_read() should timeout after 200ms, but we add an outer
@@ -528,6 +565,73 @@ class RecorderThread:
                         encoder.frame_queue.put_nowait(VideoFrame(0, image))
                     except queue.Full:
                         pass
+
+    def _poll_motor_health(self) -> None:
+        """Poll the C++ RT loop's per-motor staleness flags for both arms.
+
+        Logs (once) when any motor flips stale, and again when it
+        recovers. Counts cumulative stale frames per (side, motor) pair
+        for the post-episode summary so a downstream filter can flag
+        rows recorded while a motor was silent.
+        """
+        for side in ("left", "right"):
+            arm = getattr(self.follower, f"{side}_arm", None)
+            if arm is None or getattr(arm, "_robot", None) is None:
+                continue
+            try:
+                health = arm._robot.get_health()
+            except Exception:
+                logger.debug("get_health failed for %s arm", side, exc_info=True)
+                continue
+            if health is None:
+                continue
+            try:
+                stale = list(health.motor_stale)
+            except Exception:
+                continue
+            for i, is_stale in enumerate(stale):
+                key = (side, i)
+                prev = self._stale_prev.get(key, False)
+                if is_stale and not prev:
+                    logger.warning(
+                        "%s_%s: motor STALE at frame %d (no state reply for "
+                        "%d cycles; reads will be cached values)",
+                        side, self._motor_names[i], self.frame_index,
+                        getattr(health, "loop_count", 0)
+                            - int(health.motor_last_seen_cycle[i]),
+                    )
+                    self._stale_first_seen.setdefault(key, self.frame_index)
+                elif prev and not is_stale:
+                    logger.warning(
+                        "%s_%s: motor RECOVERED at frame %d (state replies "
+                        "resumed)",
+                        side, self._motor_names[i], self.frame_index,
+                    )
+                if is_stale:
+                    self._stale_frames[key] = (
+                        self._stale_frames.get(key, 0) + self._health_poll_period
+                    )
+                self._stale_prev[key] = is_stale
+
+    def health_summary(self) -> dict[str, list[dict]]:
+        """Return per-side per-motor staleness summary collected since
+        the last ``prepare_episode``. Empty list when nothing went stale.
+
+        Shape:
+          {"left":  [{"motor": "gripper", "first_frame": 154,
+                      "stale_frames": 7900}, ...],
+           "right": [...]}
+        """
+        out: dict[str, list[dict]] = {"left": [], "right": []}
+        for (side, i), first in self._stale_first_seen.items():
+            out[side].append({
+                "motor": self._motor_names[i],
+                "first_frame": first,
+                "stale_frames": self._stale_frames.get((side, i), 0),
+            })
+        for side in out:
+            out[side].sort(key=lambda d: d["first_frame"])
+        return out
 
     def _poll_gestures(self):
         """Check gripper gesture detectors using latest teleop action."""

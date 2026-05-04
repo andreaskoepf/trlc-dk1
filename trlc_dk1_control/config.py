@@ -84,8 +84,17 @@ class DK1RobotConfig:
         default_factory=lambda: np.array([0.02, 0.02, 0.02, 0.06, 0.06, 0.06])
     )
 
-    # Safety watchdog
-    command_timeout_s: float = 0.5    # hold position (damping only) after this idle period
+    # Safety watchdog. When no fresh command arrives for this many
+    # seconds the C++ loop re-targets ``cmd.q_des = cur_pos`` (HOLD)
+    # and then the slew limiter reverts to the safe per-cycle behaviour
+    # of "motor keeps its last good MIT frame indefinitely".
+    # 0.5 s was misleading — it fires on routine sub-second NVENC stalls
+    # and turns a recoverable freeze into a visible drop. Bumped to
+    # 3.0 s so the watchdog still catches a genuinely stuck Python but
+    # stays out of the way during normal-cause stalls (mp4 av.open, gc,
+    # etc.).
+    command_timeout_s: float = 3.0
+
     overcurrent_threshold: int = 20   # consecutive over-limit torque counts before damping
     overspeed_threshold: int = 5      # consecutive over-limit velocity counts before damping
     min_motors_required: int = 6      # throw if fewer arm motors respond during init
