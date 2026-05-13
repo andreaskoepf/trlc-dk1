@@ -166,6 +166,11 @@ struct MotorState {
     float q;
     float dq;
     float tau;
+    // Raw temperature bytes from the MIT-mode reply (data[6], data[7]).
+    // Per the DAMIAO protocol these are MOSFET and rotor temperature in °C,
+    // but the units are not yet hardware-verified — log raw bytes first.
+    uint8_t t_mos;
+    uint8_t t_rotor;
 };
 
 inline MotorState decode_motor_state(const uint8_t* packet, const MotorLimits& lim) {
@@ -179,6 +184,8 @@ inline MotorState decode_motor_state(const uint8_t* packet, const MotorLimits& l
     s.q   = uint_to_float(q_uint, -lim.q_max, lim.q_max, 16);
     s.dq  = uint_to_float(dq_uint, -lim.dq_max, lim.dq_max, 12);
     s.tau = uint_to_float(tau_uint, -lim.tau_max, lim.tau_max, 12);
+    s.t_mos   = data[6];
+    s.t_rotor = data[7];
     return s;
 }
 

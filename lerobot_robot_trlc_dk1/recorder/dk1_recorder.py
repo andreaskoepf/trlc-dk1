@@ -1010,6 +1010,24 @@ def _run_event_loop(
             ui.teleop_hz = teleop.actual_hz
             ui.frame_count = recorder.frame_index
             ui.encoder_drops = recorder.drop_count
+            # Hottest raw temperature byte per arm (max over 6 joints of
+            # max(T_MOS, T_ROTOR)). Only the RT path populates these; the
+            # legacy non-RT path returns a dict without the keys.
+            bi_follower = teleop.follower
+            for side, ui_attr in (("left_arm", "t_max_left"),
+                                  ("right_arm", "t_max_right")):
+                arm = getattr(bi_follower, side, None)
+                robot = getattr(arm, "_robot", None) if arm is not None else None
+                if robot is None:
+                    continue
+                try:
+                    js = robot.get_joint_state()
+                except Exception:
+                    continue
+                if "t_mos" in js and "t_rotor" in js:
+                    setattr(ui, ui_attr,
+                            int(max(int(js["t_mos"].max()),
+                                    int(js["t_rotor"].max()))))
 
         # -- Heartbeat (detect main thread stuck) --------------------------
         _loop_count += 1

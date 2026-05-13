@@ -69,12 +69,23 @@ def main():
                 tau_str = " ".join(f"{t:+6.2f}" for t in tau)
                 grip_str = f"{grip['torque']:+5.2f}"
 
+                # Raw temperature bytes (data[6]=T_MOS, data[7]=T_ROTOR per DAMIAO
+                # protocol; units assumed °C but not yet hardware-verified).
+                temp_str = ""
+                if "t_mos" in state and "t_rotor" in state:
+                    t_mos = state["t_mos"]
+                    t_rotor = state["t_rotor"]
+                    mos_str = " ".join(f"{int(b):3d}" for b in t_mos)
+                    rot_str = " ".join(f"{int(b):3d}" for b in t_rotor)
+                    temp_str = (f"\n  t_mos:   {mos_str}  max={int(t_mos.max())}°C"
+                                f"\n  t_rotor: {rot_str}  max={int(t_rotor.max())}°C")
+
                 perf_str = ""
                 if perf is not None:
                     perf_str = (f"  | RT: {perf.mean_cycle_us:.0f}/{perf.max_cycle_us:.0f}us"
                                 f" miss={perf.deadline_misses}")
 
-                print(f"  tau: {tau_str}  grip:{grip_str}{perf_str}")
+                print(f"  tau: {tau_str}  grip:{grip_str}{perf_str}{temp_str}")
     except KeyboardInterrupt:
         print("\nStopping teleop...")
 

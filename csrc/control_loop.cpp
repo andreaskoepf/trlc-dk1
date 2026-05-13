@@ -170,6 +170,8 @@ JointState RtControlLoop::get_joint_state() const {
             result.pos[static_cast<size_t>(i)] = state_buf_.pos[static_cast<size_t>(i)];
             result.vel[static_cast<size_t>(i)] = state_buf_.vel[static_cast<size_t>(i)];
             result.torque[static_cast<size_t>(i)] = state_buf_.torque[static_cast<size_t>(i)];
+            result.t_mos[static_cast<size_t>(i)]   = state_buf_.t_mos[static_cast<size_t>(i)];
+            result.t_rotor[static_cast<size_t>(i)] = state_buf_.t_rotor[static_cast<size_t>(i)];
         }
         uint64_t s2 = state_seq_.load(std::memory_order_acquire);
         if (s1 == s2) return result;
@@ -338,6 +340,8 @@ void RtControlLoop::configure_motors() {
                     state_buf_.pos[i] = st.q;
                     state_buf_.vel[i] = st.dq;
                     state_buf_.torque[i] = st.tau;
+                    state_buf_.t_mos[i] = st.t_mos;
+                    state_buf_.t_rotor[i] = st.t_rotor;
                     got_initial[i] = true;
                     ++total_got;
                     std::fprintf(stderr, "  %s initial pos=%.4f vel=%.4f tau=%.4f (matched can_id=0x%03X)\n",
@@ -496,6 +500,8 @@ calibration_done:
                 state_buf_.pos[6] = st.q;
                 state_buf_.vel[6] = st.dq;
                 state_buf_.torque[6] = st.tau;
+                state_buf_.t_mos[6] = st.t_mos;
+                state_buf_.t_rotor[6] = st.t_rotor;
                 // Use actual encoder reading + configured offset as open pos.
                 // After set_zero, st.q is near 0.  The offset backs off from
                 // the hard stop so the open position is force-free.
@@ -537,11 +543,15 @@ void RtControlLoop::rt_thread_func() {
     std::array<double, 7> cur_pos = {};
     std::array<double, 7> cur_vel = {};
     std::array<double, 7> cur_torque = {};
+    std::array<uint8_t, 7> cur_t_mos = {};
+    std::array<uint8_t, 7> cur_t_rotor = {};
 
     for (int i = 0; i < 7; ++i) {
         cur_pos[static_cast<size_t>(i)] = state_buf_.pos[static_cast<size_t>(i)];
         cur_vel[static_cast<size_t>(i)] = state_buf_.vel[static_cast<size_t>(i)];
         cur_torque[static_cast<size_t>(i)] = state_buf_.torque[static_cast<size_t>(i)];
+        cur_t_mos[static_cast<size_t>(i)]   = state_buf_.t_mos[static_cast<size_t>(i)];
+        cur_t_rotor[static_cast<size_t>(i)] = state_buf_.t_rotor[static_cast<size_t>(i)];
     }
 
     uint8_t tx_frame[30];
@@ -621,6 +631,8 @@ void RtControlLoop::rt_thread_func() {
                     cur_pos[i] = st.q;
                     cur_vel[i] = st.dq;
                     cur_torque[i] = st.tau;
+                    cur_t_mos[i] = st.t_mos;
+                    cur_t_rotor[i] = st.t_rotor;
                     if (i < 7) motor_responded |= (1u << i);
                     matched = true;
                     if (debug) {
@@ -670,6 +682,8 @@ void RtControlLoop::rt_thread_func() {
             state_buf_.pos = cur_pos;
             state_buf_.vel = cur_vel;
             state_buf_.torque = cur_torque;
+            state_buf_.t_mos = cur_t_mos;
+            state_buf_.t_rotor = cur_t_rotor;
             state_seq_.store(s + 2, std::memory_order_release);
         }
 

@@ -190,6 +190,9 @@ static void test_packet_parser() {
     uint16_t tau_uint = 2048;
     pkt[11] |= (tau_uint >> 8) & 0x0F;
     pkt[12] = tau_uint & 0xFF;
+    // Temperature bytes (data[6] = T_MOS at pkt[13], data[7] = T_ROTOR at pkt[14])
+    pkt[13] = 42;
+    pkt[14] = 57;
 
     // Feed packet with some garbage before it
     uint8_t garbage[] = {0x12, 0x34, 0x56};
@@ -210,6 +213,8 @@ static void test_packet_parser() {
     MotorLimits lim = {12.5f, 30.0f, 10.0f};  // DM4310
     auto state = decode_motor_state(packets[0].data(), lim);
     assert(std::abs(state.q) < 0.01f);  // should be close to 0
+    assert(state.t_mos == 42);
+    assert(state.t_rotor == 57);
 
     std::printf("  packet parser: PASS\n");
 }

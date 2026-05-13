@@ -147,6 +147,12 @@ NB_MODULE(_trlc_dk1_rt, m) {
         })
         .def_prop_ro("torque", [](const JointState& s) {
             return nb::ndarray<nb::numpy, const double, nb::shape<6>>(s.torque.data(), {6});
+        })
+        .def_prop_ro("t_mos", [](const JointState& s) {
+            return nb::ndarray<nb::numpy, const uint8_t, nb::shape<6>>(s.t_mos.data(), {6});
+        })
+        .def_prop_ro("t_rotor", [](const JointState& s) {
+            return nb::ndarray<nb::numpy, const uint8_t, nb::shape<6>>(s.t_rotor.data(), {6});
         });
 
     // GripperState

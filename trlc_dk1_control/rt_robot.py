@@ -137,18 +137,27 @@ class DK1RobotRT:
             self._loop.command_gripper(float(normalized_pos))
 
     def get_joint_state(self) -> dict[str, np.ndarray]:
-        """Return arm joint state as dict with 'pos', 'vel', 'torque' arrays."""
+        """Return arm joint state as dict with 'pos', 'vel', 'torque', 't_mos', 't_rotor' arrays.
+
+        't_mos' and 't_rotor' are the raw uint8 bytes from each motor's MIT-mode
+        reply (data[6] and data[7]). Per the DAMIAO protocol these are MOSFET
+        and rotor temperature in °C, but the units have not been hardware-verified.
+        """
         if self._loop is None:
             return {
                 "pos": np.zeros(6),
                 "vel": np.zeros(6),
                 "torque": np.zeros(6),
+                "t_mos": np.zeros(6, dtype=np.uint8),
+                "t_rotor": np.zeros(6, dtype=np.uint8),
             }
         state = self._loop.get_joint_state()
         return {
             "pos": np.array(state.pos),
             "vel": np.array(state.vel),
             "torque": np.array(state.torque),
+            "t_mos": np.array(state.t_mos),
+            "t_rotor": np.array(state.t_rotor),
         }
 
     def get_gripper_state(self) -> dict[str, float]:

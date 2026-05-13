@@ -108,6 +108,10 @@ class TerminalUI:
         self.frame_count: int = 0
         self.encoder_drops: int = 0
         self.countdown: int = 0  # countdown number (3, 2, 1, 0=GO)
+        # Hottest raw temperature byte across the 6 arm joints for each arm
+        # (max of T_MOS and T_ROTOR). 0 = not yet reported.
+        self.t_max_left: int = 0
+        self.t_max_right: int = 0
 
         self.key_queue: queue.Queue[str] = queue.Queue()
         self._stop_event = threading.Event()
@@ -226,6 +230,13 @@ class TerminalUI:
     _YELLOW = "\033[93m"
     _DIM = "\033[2m"
 
+    # Motor-temperature color thresholds (°C). The DAMIAO firmware lets you
+    # configure the protective over-temperature trip (OT_Value) anywhere in
+    # [80, 200) °C, and 80 °C is the floor they allow — so anything ≥70 °C is
+    # within 10 °C of the minimum manufacturer cutoff.
+    _TEMP_WARN_C = 50
+    _TEMP_HOT_C = 70
+
     _STATE_COLORS = {
         "idle": _DIM,
         "starting": _YELLOW + _BOLD,
@@ -243,6 +254,13 @@ class TerminalUI:
         "saving": "~ ",
         "waiting": "○ ",    # hollow dot
     }
+
+    def _temp_color(self, t: int) -> str:
+        if t >= self._TEMP_HOT_C:
+            return self._RED + self._BOLD
+        if t >= self._TEMP_WARN_C:
+            return self._YELLOW
+        return ""
 
     def _render_status(self):
         """Render colored pinned status line."""
@@ -264,11 +282,22 @@ class TerminalUI:
                 f"Ep {self.episode} | Bksp=cancel"
             )
         else:
+            temp_str = ""
+            if self.t_max_left > 0 or self.t_max_right > 0:
+                # Raw uint8 bytes from MIT-mode reply (data[6]=T_MOS, data[7]=T_ROTOR).
+                # Per the DAMIAO DM-J4310 manual these are °C; the firmware faults
+                # on B (MOS) or C (coil) overtemp once OT_Value is exceeded.
+                lc = self._temp_color(self.t_max_left)
+                rc = self._temp_color(self.t_max_right)
+                temp_str = (
+                    f" | L: {lc}{self.t_max_left}°C{self._RESET} "
+                    f"R: {rc}{self.t_max_right}°C{self._RESET}"
+                )
             line = (
                 f"  {color}{indicator}{self.state:9s}{self._RESET} | "
                 f"Ep {self.episode} | "
                 f"rec:{self.fps_actual:4.0f}Hz teleop:{self.teleop_hz:4.0f}Hz | "
-                f"{time_str}{drop_str}"
+                f"{time_str}{drop_str}{temp_str}"
             )
 
         sys.stdout.write(f"\r{line}\033[K")

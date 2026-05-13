@@ -88,6 +88,10 @@ struct JointState {
     std::array<double, 6> pos = {};
     std::array<double, 6> vel = {};
     std::array<double, 6> torque = {};
+    // Raw temperature bytes from MIT-mode replies (data[6] = MOSFET, data[7] = rotor).
+    // Units per DAMIAO protocol are °C; not yet hardware-verified.
+    std::array<uint8_t, 6> t_mos = {};
+    std::array<uint8_t, 6> t_rotor = {};
 };
 
 struct GripperState {
@@ -165,6 +169,9 @@ private:
         std::array<double, 7> pos = {};
         std::array<double, 7> vel = {};
         std::array<double, 7> torque = {};
+        // Raw temperature bytes per motor (index 0..5 arm, 6 gripper).
+        std::array<uint8_t, 7> t_mos = {};
+        std::array<uint8_t, 7> t_rotor = {};
     };
 
     RtLoopConfig cfg_;
