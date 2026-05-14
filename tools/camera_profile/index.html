@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>DK1 Camera Profile Studio</title>
+  <style>
+    :root {
+      --bg: #1c1f24;
+      --panel: #262b32;
+      --panel-2: #2f353d;
+      --border: #3a414b;
+      --text: #e6e9ee;
+      --muted: #8a93a0;
+      --accent: #6cb6ff;
+      --warn: #ffb86c;
+      --err: #ff6c6c;
+      --ok: #7be58a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--text);
+      font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    header {
+      display: flex; align-items: center; gap: 16px;
+      padding: 10px 16px;
+      background: #14171b; border-bottom: 1px solid var(--border);
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+    header .spacer { flex: 1; }
+    header .status { color: var(--muted); font-size: 12px; }
+    .toolbar {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    }
+    button, select, input[type=text] {
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 6px 10px; font: inherit;
+    }
+    button { cursor: pointer; }
+    button:hover { background: #3a414b; }
+    button.primary { background: #2c5d9a; border-color: #3a72b5; }
+    button.primary:hover { background: #3a72b5; }
+    button.danger { background: #6e2a2a; border-color: #8e3434; }
+    button.danger:hover { background: #8e3434; }
+    main {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      padding: 12px;
+    }
+    @media (max-width: 1200px) {
+      main { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 800px) {
+      main { grid-template-columns: 1fr; }
+    }
+    .cam-card {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; overflow: hidden;
+      display: flex; flex-direction: column;
+    }
+    .cam-card h2 {
+      margin: 0; padding: 8px 12px;
+      background: #20242a; border-bottom: 1px solid var(--border);
+      font-size: 13px; font-weight: 600;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .cam-card h2 .key { color: var(--accent); }
+    .cam-card h2 .device { color: var(--muted); font-weight: normal; font-size: 11px; margin-left: auto; }
+    .cam-card h2 .badge {
+      font-size: 10px; padding: 2px 6px; border-radius: 10px;
+      background: var(--panel-2); color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .cam-card h2 .badge.live { background: #214d2e; color: var(--ok); }
+    .cam-card h2 .badge.offline { background: #4d2121; color: var(--err); }
+    .cam-preview {
+      background: #000; aspect-ratio: 16 / 9;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted);
+    }
+    .cam-preview img { width: 100%; height: 100%; object-fit: contain; display: block; }
+    .cam-controls {
+      padding: 8px 12px;
+      max-height: 60vh; overflow-y: auto;
+    }
+    .cam-actions {
+      padding: 8px 12px;
+      border-top: 1px solid var(--border);
+      display: flex; gap: 6px; flex-wrap: wrap;
+    }
+    .ctrl-row {
+      padding: 6px 0; border-bottom: 1px solid #2c3138;
+    }
+    .ctrl-row:last-child { border-bottom: none; }
+    .ctrl-head {
+      display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px;
+    }
+    .ctrl-head .name { font-weight: 500; }
+    .ctrl-head .value {
+      margin-left: auto; color: var(--accent);
+      font-variant-numeric: tabular-nums; font-family: ui-monospace, "SF Mono", monospace;
+    }
+    .ctrl-head .meta {
+      color: var(--muted); font-size: 11px;
+    }
+    .ctrl-row.dirty .name::after { content: " *"; color: var(--warn); }
+    .ctrl-row input[type=range] { width: 100%; }
+    .ctrl-row.disabled { opacity: 0.4; pointer-events: none; }
+    .row-actions {
+      display: flex; gap: 4px; align-items: center; margin-top: 2px;
+    }
+    .row-actions button {
+      padding: 2px 6px; font-size: 11px;
+    }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      display: none; align-items: center; justify-content: center; z-index: 100;
+    }
+    .modal-backdrop.show { display: flex; }
+    .modal {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 6px; padding: 16px; min-width: 360px; max-width: 80vw;
+    }
+    .modal h3 { margin: 0 0 12px; }
+    .modal label { display: block; margin: 8px 0 4px; font-size: 12px; color: var(--muted); }
+    .modal input[type=text], .modal select, .modal textarea {
+      width: 100%; background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 4px; padding: 6px;
+    }
+    .modal-actions { margin-top: 14px; display: flex; gap: 6px; justify-content: flex-end; }
+    .toast {
+      position: fixed; right: 16px; bottom: 16px;
+      background: #20242a; border: 1px solid var(--border); border-radius: 4px;
+      padding: 10px 14px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      max-width: 380px;
+    }
+    .toast.ok { border-color: var(--ok); }
+    .toast.err { border-color: var(--err); }
+    .toast.warn { border-color: var(--warn); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>DK1 Camera Profile Studio</h1>
+    <div class="status" id="connStatus">connecting…</div>
+    <div class="spacer"></div>
+    <div class="toolbar">
+      <select id="profileSelect" title="Saved profiles">
+        <option value="">— load profile —</option>
+      </select>
+      <button id="btnLoad">Load &amp; apply</button>
+      <button id="btnSaveAs" class="primary">Save profile…</button>
+      <button id="btnResetAll" class="danger" title="Reset every camera to its driver defaults">Reset all to defaults</button>
+    </div>
+  </header>
+
+  <main id="cams"></main>
+
+  <div class="modal-backdrop" id="saveModal">
+    <div class="modal">
+      <h3>Save current settings as profile</h3>
+      <label for="saveFilename">Filename (.json)</label>
+      <input type="text" id="saveFilename" placeholder="indoor_warm">
+      <label for="saveName">Display name</label>
+      <input type="text" id="saveName" placeholder="Indoor warm light">
+      <label for="saveDesc">Description (optional)</label>
+      <textarea id="saveDesc" rows="2"></textarea>
+      <div class="modal-actions">
+        <button id="saveCancel">Cancel</button>
+        <button id="saveConfirm" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toastHost"></div>
+
+<script>
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => Array.from(root.querySelectorAll(s));
+
+function toast(msg, kind = "ok", timeout = 3500) {
+  const host = $("#toastHost");
+  const el = document.createElement("div");
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  host.appendChild(el);
+  setTimeout(() => el.remove(), timeout);
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, {
+    headers: { "Content-Type": "application/json" },
+    ...opts,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || `HTTP ${res.status}`);
+  }
+  return data;
+}
+
+const state = {
+  cameras: [],
+  controls: {},  // {cam_key: [ControlJSON]}
+};
+
+async function loadCameras() {
+  const { cameras } = await api("/api/cameras");
+  state.cameras = cameras;
+  renderCameraCards();
+  for (const c of cameras) {
+    if (c.available) {
+      try {
+        await loadControls(c.key);
+      } catch (e) {
+        toast(`load controls for ${c.key} failed: ${e.message}`, "err");
+      }
+    }
+  }
+}
+
+async function loadControls(camKey) {
+  const { controls } = await api(`/api/controls/${encodeURIComponent(camKey)}`);
+  state.controls[camKey] = controls;
+  renderControls(camKey);
+}
+
+function renderCameraCards() {
+  const root = $("#cams");
+  root.innerHTML = "";
+  for (const cam of state.cameras) {
+    const card = document.createElement("section");
+    card.className = "cam-card";
+    card.dataset.key = cam.key;
+    card.innerHTML = `
+      <h2>
+        <span class="key">${cam.key}</span>
+        <span class="badge" data-badge>…</span>
+        <span class="device" title="${cam.device}">${cam.device.split("/").pop()}</span>
+      </h2>
+      <div class="cam-preview">
+        ${cam.available
+          ? `<img src="/stream/${encodeURIComponent(cam.key)}" alt="${cam.key} preview">`
+          : `<div>unavailable: ${cam.connect_error || "—"}</div>`}
+      </div>
+      <div class="cam-controls" data-controls></div>
+      <div class="cam-actions">
+        <button data-action="reset-cam">Reset to defaults</button>
+        <button data-action="refresh-cam">Re-read values</button>
+      </div>
+    `;
+    card.addEventListener("click", (ev) => {
+      const action = ev.target.dataset.action;
+      if (action === "reset-cam") resetCamera(cam.key);
+      if (action === "refresh-cam") loadControls(cam.key);
+    });
+    root.appendChild(card);
+  }
+}
+
+function renderControls(camKey) {
+  const card = $(`.cam-card[data-key="${cssEscape(camKey)}"]`);
+  if (!card) return;
+  const host = $("[data-controls]", card);
+  const controls = state.controls[camKey] || [];
+  host.innerHTML = "";
+  for (const c of controls) {
+    if (c.type === "class") continue;  // section headers from the driver
+    host.appendChild(renderControlRow(camKey, c));
+  }
+}
+
+// UVC integer controls that don't carry their own menu labels but have a
+// well-known small enumeration. Add entries here if more cameras land with
+// labeled mode-style integer controls.
+const INT_VALUE_LABELS = {
+  "Backlight Compensation": { 0: "Off", 1: "Low", 2: "High" },
+};
+
+function renderControlRow(camKey, c) {
+  const row = document.createElement("div");
+  row.className = "ctrl-row";
+  if (!c.writable) row.classList.add("disabled");
+  const id = `ctl-${camKey}-${c.id}`;
+  if (c.type === "bool") {
+    row.innerHTML = `
+      <div class="ctrl-head">
+        <label class="name" for="${id}">${escapeHtml(c.name)}</label>
+        <span class="meta">default ${c.default}</span>
+        <span class="value" data-val>${c.current ?? "—"}</span>
+      </div>
+      <input type="checkbox" id="${id}" ${c.current ? "checked" : ""}>
+      <div class="row-actions">
+        <button data-act="default">use default</button>
+      </div>
+    `;
+    const cb = $("input", row);
+    cb.addEventListener("change", () => {
+      setControl(camKey, c.name, cb.checked ? 1 : 0, row);
+    });
+  } else if (
+    c.type === "menu" || c.type === "int_menu"
+    || (c.type === "int" && c.step === 1 && (c.maximum - c.minimum) <= 4)
+  ) {
+    // Real V4L2 menus carry labels; short-range ints (like Backlight
+    // Compensation 0..2) get rendered as a dropdown of bare numbers so
+    // discrete modes are clickable instead of slider-fiddly.
+    const labels = INT_VALUE_LABELS[c.name] || null;
+    const items = c.menu
+      ? c.menu.map(([i, n]) => [i, `${n} (${i})`])
+      : Array.from({ length: c.maximum - c.minimum + 1 }, (_, k) => {
+          const v = c.minimum + k;
+          const named = labels && labels[v] != null;
+          return [v, named ? `${v} - ${labels[v]}` : String(v)];
+        });
+    const opts = items.map(
+      ([idx, label]) => `<option value="${idx}" ${idx === c.current ? "selected" : ""}>${escapeHtml(label)}</option>`
+    ).join("");
+    row.innerHTML = `
+      <div class="ctrl-head">
+        <label class="name" for="${id}">${escapeHtml(c.name)}</label>
+        <span class="meta">default ${c.default}</span>
+        <span class="value" data-val>${c.current ?? "—"}</span>
+      </div>
+      <select id="${id}">${opts}</select>
+      <div class="row-actions">
+        <button data-act="default">use default</button>
+      </div>
+    `;
+    const sel = $("select", row);
+    sel.addEventListener("change", () => {
+      setControl(camKey, c.name, parseInt(sel.value, 10), row);
+    });
+  } else {
+    // integer
+    row.innerHTML = `
+      <div class="ctrl-head">
+        <label class="name" for="${id}">${escapeHtml(c.name)}</label>
+        <span class="meta">[${c.minimum}…${c.maximum}] default ${c.default}</span>
+        <span class="value" data-val>${c.current ?? "—"}</span>
+      </div>
+      <input type="range" id="${id}"
+             min="${c.minimum}" max="${c.maximum}" step="${c.step || 1}"
+             value="${c.current ?? c.default}">
+      <div class="row-actions">
+        <button data-act="default">use default</button>
+      </div>
+    `;
+    const slider = $("input", row);
+    const valLabel = $("[data-val]", row);
+    let pending = null;
+    slider.addEventListener("input", () => {
+      valLabel.textContent = slider.value;
+      // Debounce: only fire one set per ~80ms.
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => {
+        pending = null;
+        setControl(camKey, c.name, parseInt(slider.value, 10), row);
+      }, 80);
+    });
+  }
+  row.addEventListener("click", (ev) => {
+    if (ev.target.dataset.act === "default") {
+      setControl(camKey, c.name, c.default, row);
+    }
+  });
+  // Mark dirty if current != default.
+  if (c.current !== null && c.current !== c.default) row.classList.add("dirty");
+  return row;
+}
+
+async function setControl(camKey, name, value, row) {
+  try {
+    const { value: applied } = await api(
+      `/api/controls/${encodeURIComponent(camKey)}/${encodeURIComponent(name)}`,
+      { method: "POST", body: JSON.stringify({ value }) }
+    );
+    const valEl = row && $("[data-val]", row);
+    if (valEl) valEl.textContent = applied;
+    // Sync the input DOM (slider / checkbox / select) so "use default" and
+    // any driver-side clamping/step-rounding move the widget visibly.
+    if (row) {
+      const input = $("input, select", row);
+      if (input) {
+        if (input.type === "checkbox") input.checked = !!applied;
+        else input.value = String(applied);
+      }
+    }
+    // Update cached + dirty state.
+    const ctrls = state.controls[camKey] || [];
+    const c = ctrls.find((x) => x.name === name);
+    if (c) {
+      c.current = applied;
+      if (row) row.classList.toggle("dirty", applied !== c.default);
+    }
+  } catch (e) {
+    toast(`${camKey} / ${name}: ${e.message}`, "err");
+  }
+}
+
+async function resetCamera(camKey) {
+  if (!confirm(`Reset ${camKey} to driver defaults?`)) return;
+  try {
+    await api(`/api/reset/${encodeURIComponent(camKey)}`, { method: "POST" });
+    toast(`${camKey} reset to defaults`, "ok");
+    await loadControls(camKey);
+  } catch (e) {
+    toast(`reset failed: ${e.message}`, "err");
+  }
+}
+
+async function resetAll() {
+  if (!confirm("Reset ALL cameras to driver defaults?")) return;
+  try {
+    await api(`/api/reset`, { method: "POST" });
+    toast("All cameras reset to defaults", "ok");
+    for (const c of state.cameras) if (c.available) await loadControls(c.key);
+  } catch (e) {
+    toast(`reset failed: ${e.message}`, "err");
+  }
+}
+
+async function loadProfileList() {
+  const { profiles } = await api("/api/profile/list");
+  const sel = $("#profileSelect");
+  // Keep first placeholder option.
+  while (sel.options.length > 1) sel.remove(1);
+  for (const p of profiles) {
+    const opt = document.createElement("option");
+    opt.value = p.filename;
+    opt.textContent = p.name + (p.description ? ` — ${p.description}` : ` (${p.filename})`);
+    sel.appendChild(opt);
+  }
+}
+
+async function loadProfile() {
+  const filename = $("#profileSelect").value;
+  if (!filename) { toast("Choose a profile first", "warn"); return; }
+  try {
+    const r = await api("/api/profile/load", {
+      method: "POST", body: JSON.stringify({ filename }),
+    });
+    toast(`Applied ${filename}`, "ok");
+    for (const c of state.cameras) if (c.available) await loadControls(c.key);
+  } catch (e) {
+    toast(`load failed: ${e.message}`, "err");
+  }
+}
+
+function openSaveModal() {
+  $("#saveFilename").value = "";
+  $("#saveName").value = "";
+  $("#saveDesc").value = "";
+  $("#saveModal").classList.add("show");
+  $("#saveFilename").focus();
+}
+
+async function confirmSave() {
+  const filename = $("#saveFilename").value.trim();
+  if (!filename) { toast("Filename required", "warn"); return; }
+  const name = $("#saveName").value.trim() || filename;
+  const description = $("#saveDesc").value.trim();
+  try {
+    const r = await api("/api/profile/save", {
+      method: "POST",
+      body: JSON.stringify({ filename, name, description }),
+    });
+    toast(`Saved ${r.saved}`, "ok");
+    $("#saveModal").classList.remove("show");
+    await loadProfileList();
+  } catch (e) {
+    toast(`save failed: ${e.message}`, "err");
+  }
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function cssEscape(s) {
+  return String(s).replace(/"/g, '\\"');
+}
+
+// --- wire up -----------------------------------------------------------------
+
+$("#btnLoad").addEventListener("click", loadProfile);
+$("#btnSaveAs").addEventListener("click", openSaveModal);
+$("#btnResetAll").addEventListener("click", resetAll);
+$("#saveCancel").addEventListener("click", () => $("#saveModal").classList.remove("show"));
+$("#saveConfirm").addEventListener("click", confirmSave);
+
+async function pollStatus() {
+  try {
+    const { cameras } = await api("/api/cameras");
+    let liveCount = 0;
+    for (const cam of cameras) {
+      if (cam.live) liveCount++;
+      const card = $(`.cam-card[data-key="${cssEscape(cam.key)}"]`);
+      if (!card) continue;
+      const badge = $("[data-badge]", card);
+      if (badge) {
+        badge.classList.toggle("live", !!cam.live);
+        badge.classList.toggle("offline", !cam.live);
+        badge.textContent = cam.live ? "LIVE" : "OFFLINE";
+        badge.title = cam.live
+          ? "frames streaming"
+          : (cam.connect_error || "no frames in the last 2s");
+      }
+      // Two independent reasons to refresh:
+      //   (a) the camera just went offline→live (transition we observed), or
+      //   (b) the server's per-camera open_count advanced since we last
+      //       checked (catches the case where an inactive tab throttled
+      //       polling and we missed the offline window — e.g. user swapped
+      //       the camera while looking at another tab).
+      const prev = card.dataset.live === "1";
+      const prevOpenCount = parseInt(card.dataset.opens || "0", 10);
+      const needsRefresh =
+        (cam.live && !prev) ||
+        (cam.open_count > prevOpenCount && prevOpenCount > 0);
+      if (needsRefresh && cam.live) {
+        const img = $("img", card);
+        if (img) {
+          // Cache-bust the stream URL to force a fresh MJPEG connection.
+          const u = new URL(img.src, location.href);
+          u.searchParams.set("t", Date.now().toString());
+          img.src = u.toString();
+        }
+        // Read whatever the camera currently reports — covers a swap to a
+        // different physical unit with different drift.
+        loadControls(cam.key).catch(() => {});
+      }
+      card.dataset.live = cam.live ? "1" : "0";
+      card.dataset.opens = String(cam.open_count || 0);
+    }
+    $("#connStatus").textContent =
+      `${liveCount} / ${cameras.length} cameras live`;
+  } catch (e) {
+    $("#connStatus").textContent = `status error: ${e.message}`;
+  }
+}
+
+async function boot() {
+  try {
+    await loadCameras();
+    await loadProfileList();
+    await pollStatus();
+    setInterval(pollStatus, 2000);
+  } catch (e) {
+    $("#connStatus").textContent = `error: ${e.message}`;
+  }
+}
+boot();
+</script>
+</body>
+</html>

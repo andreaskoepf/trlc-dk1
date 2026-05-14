@@ -1,0 +1,54 @@
+{
+  "name": "Backlight Compensation High",
+  "description": "backlight compensation set to 2 on all three cams",
+  "cameras": {
+    "WRIST_LEFT": {
+      "Brightness": 0,
+      "Contrast": 52,
+      "Saturation": 64,
+      "Hue": 0,
+      "White Balance, Automatic": 1,
+      "Gamma": 300,
+      "Gain": 64,
+      "Power Line Frequency": 1,
+      "White Balance Temperature": 4600,
+      "Sharpness": 50,
+      "Backlight Compensation": 2,
+      "Auto Exposure": 3,
+      "Exposure Time, Absolute": 166,
+      "Exposure, Dynamic Framerate": 0
+    },
+    "WRIST_RIGHT": {
+      "Brightness": 0,
+      "Contrast": 52,
+      "Saturation": 64,
+      "Hue": 0,
+      "White Balance, Automatic": 1,
+      "Gamma": 300,
+      "Gain": 64,
+      "Power Line Frequency": 1,
+      "White Balance Temperature": 4600,
+      "Sharpness": 50,
+      "Backlight Compensation": 2,
+      "Auto Exposure": 3,
+      "Exposure Time, Absolute": 166,
+      "Exposure, Dynamic Framerate": 0
+    },
+    "CONTEXT_CAM": {
+      "Brightness": 0,
+      "Contrast": 52,
+      "Saturation": 64,
+      "Hue": 0,
+      "White Balance, Automatic": 1,
+      "Gamma": 300,
+      "Gain": 64,
+      "Power Line Frequency": 1,
+      "White Balance Temperature": 4600,
+      "Sharpness": 50,
+      "Backlight Compensation": 2,
+      "Auto Exposure": 3,
+      "Exposure Time, Absolute": 166,
+      "Exposure, Dynamic Framerate": 1
+    }
+  }
+}

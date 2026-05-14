@@ -63,6 +63,12 @@ DEFAULT_CAMERA_HEIGHT = 360
 DEFAULT_CAMERA_FPS = 60
 CAMERA_KEYS = ["head", "left_wrist", "right_wrist"]
 
+# Default UVC profile applied before every recording session. Resets the
+# wrist cams back to known-good values so a leftover Guvcview tweak can't
+# silently colour-cast a dataset. Override with --camera-profile <path> or
+# disable with --camera-profile "".
+DEFAULT_CAMERA_PROFILE = Path("profiles/cameras/default_cam_profile.json")
+
 
 # ---------------------------------------------------------------------------
 # State machine
@@ -197,6 +203,13 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--camera-fps", type=int, default=DEFAULT_CAMERA_FPS,
+    )
+    p.add_argument(
+        "--camera-profile", type=str, default=str(DEFAULT_CAMERA_PROFILE),
+        help="JSON profile written by `python -m tools.camera_profile`; "
+             "applied to every UVC camera right before they're opened so "
+             "brightness/saturation/etc. start from a known state. "
+             "Default: %(default)s. Pass an empty string to skip.",
     )
     p.add_argument(
         "--obs-signals", type=str, default="pos,vel,torque",
@@ -397,6 +410,44 @@ def main():
     logger.info("Connecting follower arms (ensure E-Stop is released)...")
     follower.connect()
     logger.info("Follower arms connected")
+
+    # Apply UVC profile (brightness/saturation/exposure/...) before the
+    # cameras are opened by OpenCV. The settings persist in the camera's
+    # firmware, so a stray Guvcview session can otherwise leave the wrist
+    # cams with a colour cast in the recording. The default profile is
+    # checked into the repo; users opt out with --camera-profile "".
+    cam_profile_path = (args.camera_profile or "").strip()
+    if cam_profile_path:
+        prof_path = Path(cam_profile_path)
+        is_default = prof_path == DEFAULT_CAMERA_PROFILE
+        if not prof_path.is_file():
+            if is_default:
+                logger.warning(
+                    "Camera profile %s missing — skipping. Recreate with "
+                    "`python -m tools.camera_profile`, or pass "
+                    "--camera-profile \"\" to silence this.",
+                    prof_path,
+                )
+                prof_path = None
+            else:
+                logger.error("Camera profile not found: %s", prof_path)
+                sys.exit(1)
+        if prof_path is not None:
+            from tools.camera_profile.profile import (
+                apply_profile as _apply_cam_profile,
+                load_profile as _load_cam_profile,
+            )
+            prof = _load_cam_profile(prof_path)
+            logger.info("Applying camera profile %r from %s", prof.name, prof_path)
+            cam_paths_for_profile = {
+                "WRIST_LEFT": left_wrist_path,
+                "WRIST_RIGHT": right_wrist_path,
+                "CONTEXT_CAM": head_cam_path,
+            }
+            changes = _apply_cam_profile(prof, cam_paths_for_profile)
+            for cam_key, c in changes.items():
+                if c:
+                    logger.info("  %s: %d controls changed", cam_key, len(c))
 
     # Connect cameras separately
     logger.info("Connecting cameras...")
