@@ -482,12 +482,19 @@ class RecorderThread:
                     obs_state[0], obs_state[3], obs_state[6],
                 )
             elif self.teleop.auto_home_at_rest:
-                # Auto-home ramp done — check joints against absolute zero
+                # Auto-home ramp done — check joints against absolute zero,
+                # restricted to arms that actually ramped (undeparted arms
+                # are merely within 0.5 rad hysteresis, not 0.1 rad zero).
                 from lerobot_robot_trlc_dk1.recorder.rest_pose_detector import (
-                    _JOINT_POS_INDICES, _VEL_INDICES,
+                    _PER_ARM_JOINT_POS_INDICES, _PER_ARM_VEL_INDICES,
                 )
-                joint_pos = obs_state[_JOINT_POS_INDICES]
-                joint_vel = obs_state[_VEL_INDICES]
+                settled_arms = self.teleop.auto_home_settled_arms
+                pos_idx = [i for arm in settled_arms
+                           for i in _PER_ARM_JOINT_POS_INDICES[arm]]
+                vel_idx = [i for arm in settled_arms
+                           for i in _PER_ARM_VEL_INDICES[arm]]
+                joint_pos = obs_state[pos_idx]
+                joint_vel = obs_state[vel_idx]
                 pos_err = float(np.max(np.abs(joint_pos)))
                 max_vel = float(np.max(np.abs(joint_vel)))
                 pos_ok = pos_err < 0.1
@@ -502,13 +509,13 @@ class RecorderThread:
                 # a stuck episode self-reports which check is failing.
                 if self.frame_index % max(1, self.fps) == 0:
                     worst_pos_key = OBS_STATE_KEYS[
-                        _JOINT_POS_INDICES[int(np.argmax(np.abs(joint_pos)))]]
+                        pos_idx[int(np.argmax(np.abs(joint_pos)))]]
                     worst_vel_key = OBS_STATE_KEYS[
-                        _VEL_INDICES[int(np.argmax(np.abs(joint_vel)))]]
+                        vel_idx[int(np.argmax(np.abs(joint_vel)))]]
                     logger.info(
-                        "Auto-home settle frame %d: pos_err=%.3f (%s) "
+                        "Auto-home settle frame %d [arms=%s]: pos_err=%.3f (%s) "
                         "vel=%.3f (%s) | %s/%s | settle=%d/%d",
-                        self.frame_index,
+                        self.frame_index, ",".join(settled_arms),
                         pos_err, worst_pos_key,
                         max_vel, worst_vel_key,
                         "pos_ok" if pos_ok else "POS_FAIL",

@@ -38,6 +38,19 @@ _JOINT_POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS)
 _GRIPPER_POS_INDICES = [i for i, k in enumerate(OBS_STATE_KEYS)
                         if "gripper.pos" in k]
 
+# Per-arm joint position / velocity indices, used by the recorder's
+# auto-home settle check to ignore arms that never ramped to zero.
+_PER_ARM_JOINT_POS_INDICES: dict[str, list[int]] = {
+    arm: [i for i, k in enumerate(OBS_STATE_KEYS)
+          if ".pos" in k and "gripper" not in k and k.startswith(f"{arm}_")]
+    for arm in ("left", "right")
+}
+_PER_ARM_VEL_INDICES: dict[str, list[int]] = {
+    arm: [i for i, k in enumerate(OBS_STATE_KEYS)
+          if ".vel" in k and k.startswith(f"{arm}_")]
+    for arm in ("left", "right")
+}
+
 
 class RestPoseDetector:
     """Detect when the robot has returned to its resting position.

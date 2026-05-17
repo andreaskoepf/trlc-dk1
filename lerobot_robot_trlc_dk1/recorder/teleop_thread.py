@@ -122,14 +122,35 @@ class TeleopThread:
 
     @property
     def auto_home_at_rest(self) -> bool:
-        """True only when ALL arms have completed their ramp to zero."""
+        """True when every arm is at rest near zero.
+
+        An arm counts as at-rest if it (a) ramped down and the ramp duration
+        has elapsed, or (b) never departed — by the 0.5 rad hysteresis in
+        ``_apply_auto_home``, an undeparted arm is still within rest range.
+        At least one arm must have actually ramped, so this never fires at
+        episode start before any teleop activity.
+        """
+        return len(self.auto_home_settled_arms) > 0 and all(
+            not self._auto_home_departed[arm]
+            or arm in self.auto_home_settled_arms
+            for arm in self.ARMS
+        )
+
+    @property
+    def auto_home_settled_arms(self) -> tuple[str, ...]:
+        """Arms that completed their auto-home ramp to zero.
+
+        Subset of ``self.ARMS``. The recorder's at-rest settle check uses
+        this to validate absolute-zero position only on arms that actually
+        ramped — undeparted arms are merely within the 0.5 rad hysteresis
+        and would otherwise falsely fail the tight zero tolerance.
+        """
         now = time.perf_counter()
-        for arm in self.ARMS:
-            if not self._auto_home_ramping[arm]:
-                return False
-            if now - self._auto_home_ramp_start[arm] < self._auto_home_ramp_duration:
-                return False
-        return True
+        return tuple(
+            arm for arm in self.ARMS
+            if self._auto_home_ramping[arm]
+            and now - self._auto_home_ramp_start[arm] >= self._auto_home_ramp_duration
+        )
 
     @auto_home_active.setter
     def auto_home_active(self, value: bool):
