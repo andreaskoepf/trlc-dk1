@@ -400,20 +400,11 @@
       effort="20"
       velocity="0.18" />
   </joint>
-  <!-- TCP / fingertip grasp point (+0.158m along approach). -->
-  <link name="tcp" />
-  <joint name="tcp_joint" type="fixed">
-    <origin
-      xyz="0.158 0 0"
-      rpy="-1.5707963267948966 0 -1.5707963267948966" />
-    <parent
-      link="link6-7" />
-    <child
-      link="tcp" />
-  </joint>
   <!-- tool0 = FLANGE (ROS-Industrial convention): link6-7 origin (wrist, zero lever)
        with OpenCV orientation (z=approach/front, x=right). This is the effector frame
-       for cartesian actions — decouples position deltas from wrist-rotation lever. -->
+       for cartesian actions — decouples position deltas from wrist-rotation lever.
+       tcp and fingertips_center are children of tool0, so their offsets are pure
+       translations along tool-z (approach). -->
   <link name="tool0" />
   <joint name="tool0_joint" type="fixed">
     <origin
@@ -423,6 +414,28 @@
       link="link6-7" />
     <child
       link="tool0" />
+  </joint>
+  <!-- TCP / grasp point, 5mm before the finger tips. -->
+  <link name="tcp" />
+  <joint name="tcp_joint" type="fixed">
+    <origin
+      xyz="0 0 0.153"
+      rpy="0 0 0" />
+    <parent
+      link="tool0" />
+    <child
+      link="tcp" />
+  </joint>
+  <!-- Geometric finger tip plane (use for clearance checks / pre-grasp approach). -->
+  <link name="fingertips_center" />
+  <joint name="fingertips_center_joint" type="fixed">
+    <origin
+      xyz="0 0 0.158"
+      rpy="0 0 0" />
+    <parent
+      link="tool0" />
+    <child
+      link="fingertips_center" />
   </joint>
 
   <!-- Wrist camera (sensor frame) -->
