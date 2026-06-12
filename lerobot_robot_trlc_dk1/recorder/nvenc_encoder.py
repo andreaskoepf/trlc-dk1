@@ -142,6 +142,12 @@ class NvencEncoder:
                 "tune": "hq",
                 "g": str(gop),
                 "max_b_frames": "0",
+                # Honour per-frame keyframe requests (pict_type=I at the episode
+                # start) and emit them as true IDRs. Without this, NVENC ignores
+                # pict_type and the episode would start mid-GOP, forcing a lossy
+                # re-encode to strip the pre-roll. With it, the pre-roll can be
+                # trimmed with a lossless stream-copy from the episode-start IDR.
+                "forced-idr": "1",
             }
         elif codec == "libx264":
             self.codec_options = {
@@ -281,6 +287,11 @@ class NvencEncoder:
         episode_frames = 0    # frames after StartEpisode
         pre_roll_frames = 0   # frames before StartEpisode
         recording = not rolling  # if not rolling, we're recording immediately
+        # Force an IDR on the first episode frame so the pre-roll can later be
+        # trimmed with a lossless stream-copy (no re-encode). In the rolling
+        # path this is set when StartEpisode arrives; in the direct path the
+        # first frame is the episode start.
+        force_keyframe = not rolling
         stats_frames: list[np.ndarray] = []
 
         logger.debug("Encoder %s: episode %d %s → %s",
@@ -302,6 +313,9 @@ class NvencEncoder:
                 # Mark the boundary: everything before is pre-roll
                 pre_roll_frames = total_frames
                 recording = True
+                # Force the next encoded frame to be an IDR so the pre-roll is
+                # trimmable by a lossless stream-copy from this point.
+                force_keyframe = True
                 logger.debug("Encoder %s: episode start at MP4 frame %d",
                              self.cam_key, total_frames)
                 continue
@@ -316,6 +330,10 @@ class NvencEncoder:
             try:
                 video_frame = av.VideoFrame.from_ndarray(msg.image, format="rgb24")
                 video_frame.pts = total_frames
+                if force_keyframe:
+                    # Requires forced-idr=1 in codec_options for NVENC to honour it.
+                    video_frame.pict_type = av.video.frame.PictureType.I
+                    force_keyframe = False
                 for packet in stream.encode(video_frame):
                     container.mux(packet)
             except Exception:
